@@ -256,6 +256,61 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.kid.get("/api/rev").json["rev"], r1)
         self.assertEqual(self.kid.get("/api/data").json["rev"], r1)
 
+    def test_20_api_tokens_and_chores(self):
+        ext = karma.app.test_client()
+        self.assertEqual(ext.get("/api/ext/kids").status_code, 401)
+        self.assertEqual(self.kid.post("/api/tokens", json={"name": "x"}).status_code, 403)  # kids can't make tokens
+        tok = self.parent.post("/api/tokens", json={"name": "Home Assistant"}).json["token"]
+        self.assertTrue(tok.startswith("kj_"))
+        self.assertEqual(self.parent.post("/api/tokens", json={"name": "Home Assistant"}).status_code, 400)
+        h = {"Authorization": f"Bearer {tok}"}
+        self.assertIn("POST /api/ext/chores", ext.get("/api/ext", headers=h).json["endpoints"])
+        self.assertEqual({k["name"] for k in ext.get("/api/ext/kids", headers=h).json["kids"]} >= {"Ana", "Ben"}, True)
+
+        r0 = self.kid.get("/api/rev").json["rev"]
+        body = {"title": "Refill the vacuum's water tank", "kids": "ana", "reward": 0.5, "due_in_minutes": 90, "key": "vacuum-clean-water"}
+        r = ext.post("/api/ext/chores", json=body, headers=h)
+        self.assertEqual((r.status_code, r.json["created"]), (201, True))
+        c = r.json["chores"][0]
+        self.assertEqual((c["kid"], c["reward"], c["source"], c["key"]), ("Ana", 0.5, "Home Assistant", "vacuum-clean-water"))
+        self.assertGreater(self.kid.get("/api/rev").json["rev"], r0, "kid screens refresh")
+        # the automation fires again while the tank is still empty: no duplicate, no reload
+        r1 = self.kid.get("/api/rev").json["rev"]
+        r = ext.post("/api/ext/chores", json=body, headers={"X-Api-Key": tok})
+        self.assertEqual((r.status_code, r.json["created"], r.json["chores"][0]["id"]), (200, False, c["id"]))
+        self.assertEqual(self.kid.get("/api/rev").json["rev"], r1)
+        self.assertEqual(ext.get("/api/ext/chores?key=vacuum-clean-water", headers=h).json["count"], 1)
+        mine = next(x for x in self.kid.get("/api/data").json["chores"] if x["id"] == c["id"])
+        self.assertEqual(mine["source"], "Home Assistant")
+        # once it's done and approved, the same key can create a fresh chore
+        self.kid.post(f"/api/chores/{c['id']}/submit")
+        self.assertEqual(ext.get("/api/ext/chores?key=vacuum-clean-water", headers=h).json["chores"][0]["status"], "submitted")
+        self.parent.post(f"/api/chores/{c['id']}/approve", json={})
+        r = ext.post("/api/ext/chores", json=body, headers=h)
+        self.assertEqual(r.json["created"], True)
+
+        # together for both, unknown kid, missing title
+        r = ext.post("/api/ext/chores", json={"title": "Empty dirty water", "kids": ["Ana", "Ben"], "together": True}, headers=h)
+        self.assertEqual([x["together"] for x in r.json["chores"]], [True, True])
+        bad = ext.post("/api/ext/chores", json={"title": "x", "kids": "Zed"}, headers=h)
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("Ana", bad.json["error"])
+        self.assertEqual(ext.post("/api/ext/chores", json={"kids": "all"}, headers=h).status_code, 400)
+
+        # delete: only own, only to-do
+        agent = self.parent.post("/api/tokens", json={"name": "Claude Code"}).json["token"]
+        ha_id = r.json["chores"][0]["id"]
+        self.assertEqual(ext.delete(f"/api/ext/chores/{ha_id}", headers={"Authorization": f"Bearer {agent}"}).status_code, 403)
+        self.assertEqual(ext.delete(f"/api/ext/chores/{ha_id}", headers=h).status_code, 200)
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM chores WHERE title='Empty dirty water'")[0]["n"], 0)
+
+        # revoke
+        tid = next(t["id"] for t in self.parent.get("/api/data").json["tokens"] if t["name"] == "Home Assistant")
+        self.assertIsNotNone(next(t for t in self.parent.get("/api/data").json["tokens"] if t["id"] == tid)["last_used_at"])
+        self.parent.delete(f"/api/tokens/{tid}")
+        self.assertEqual(ext.get("/api/ext/kids", headers=h).status_code, 401)
+        self.assertEqual(ext.get("/api/ext/kids", headers={"Authorization": f"Bearer {agent}"}).status_code, 200)
+
     def test_99_last_parent_protected(self):
         self.assertEqual(self.parent.delete(f"/api/users/{self.dad}").status_code, 200)
         me = self.parent.get("/api/state").json["me"]["id"]
