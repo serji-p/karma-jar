@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Turn on HTTPS for Karma Jar with a DuckDNS name. Run ON the server, as root:
+#   karma-jar-https install              # install Caddy with the DuckDNS plugin (no settings needed)
+#   karma-jar-https setup <subdomain>    # e.g. karmajar or karmajar.duckdns.org; asks for the token
+#   karma-jar-https status
+# The app stays private: the DuckDNS name points at this server's home-network address and
+# the certificate is issued through a DNS record, so nothing is opened to the internet.
+set -euo pipefail
+ENV=/etc/caddy/karma.env
+SRC=/opt/karma-jar/deploy
+
+install_caddy() {
+  if [ -x /usr/local/bin/caddy ] && /usr/local/bin/caddy list-modules 2>/dev/null | grep -q '^dns.providers.duckdns$'; then
+    echo "Caddy with DuckDNS is already installed: $(/usr/local/bin/caddy version | cut -d' ' -f1)"
+  else
+    case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported CPU $(uname -m)"; exit 1 ;; esac
+    echo "Downloading Caddy with the DuckDNS plugin from caddyserver.com ..."
+    wget -q -O /tmp/caddy.new "https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com%2Fcaddy-dns%2Fduckdns"
+    chmod 755 /tmp/caddy.new
+    /tmp/caddy.new list-modules | grep -q '^dns.providers.duckdns$' || { echo "download has no DuckDNS plugin"; exit 1; }
+    mv /tmp/caddy.new /usr/local/bin/caddy
+    echo "Installed $(/usr/local/bin/caddy version | cut -d' ' -f1)"
+  fi
+  id caddy >/dev/null 2>&1 || useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy
+  mkdir -p /etc/caddy
+  install -m 644 "$SRC/Caddyfile" /etc/caddy/Caddyfile
+  install -m 644 "$SRC/caddy.service" /etc/systemd/system/caddy.service
+  systemctl daemon-reload
+  systemctl enable -q caddy
+}
+
+my_ip() { ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p'; }
+
+setup() {
+  local name="${1:?usage: karma-jar-https setup <subdomain>}"
+  name="${name%.duckdns.org}"; name="${name##*.}"   # karmajar.duckdns.org / a.karmajar -> karmajar
+  local domain="$name.duckdns.org" ip; ip="$(my_ip)"
+  install_caddy
+  local token=""
+  if [ -f "$ENV" ]; then token="$(sed -n 's/^DUCKDNS_TOKEN=//p' "$ENV")"; fi
+  if [ -n "$token" ]; then
+    read -r -p "Keep the DuckDNS token already saved? [Y/n] " a
+    case "$a" in [nN]*) token="" ;; esac
+  fi
+  while [ -z "$token" ]; do read -r -s -p "DuckDNS token (from duckdns.org, hidden): " token; echo; done
+
+  local now; now="$(getent ahostsv4 "$domain" | awk 'NR==1{print $1}' || true)"
+  if [ "$now" != "$ip" ]; then
+    echo "$domain currently points at: ${now:-nothing}"
+    read -r -p "Point $domain at this server ($ip)? Only say yes if nothing else uses this name. [y/N] " a
+    case "$a" in
+      [yY]*) r="$(wget -q -O - "https://www.duckdns.org/update?domains=${name}&token=${token}&ip=${ip}")"
+             [ "$r" = "OK" ] || { echo "DuckDNS refused the update (wrong subdomain or token?)"; exit 1; }
+             echo "Updated." ;;
+      *) echo "Left it as it is. Devices must still resolve $domain to $ip (e.g. a local DNS entry)." ;;
+    esac
+  fi
+
+  umask 077
+  printf 'KARMA_DOMAIN=%s\nDUCKDNS_TOKEN=%s\n' "$domain" "$token" > "$ENV"
+  chmod 600 "$ENV"
+  systemctl restart caddy
+  echo "Getting the certificate (can take a minute) ..."
+  for _ in $(seq 1 45); do
+    if journalctl -u caddy --since "-3 min" --no-pager | grep -q 'certificate obtained successfully'; then
+      echo "Done: https://$domain"; return 0
+    fi
+    if ls /var/lib/caddy/.local/share/caddy/certificates/*/"$domain"/"$domain".crt >/dev/null 2>&1; then
+      echo "Done: https://$domain"; return 0
+    fi
+    sleep 4
+  done
+  echo "No certificate yet. Recent Caddy log:"; journalctl -u caddy -n 20 --no-pager; exit 1
+}
+
+status() {
+  systemctl is-active caddy || true
+  [ -f "$ENV" ] && sed -n 's/^KARMA_DOMAIN=/domain: /p' "$ENV"
+  ls /var/lib/caddy/.local/share/caddy/certificates/*/ 2>/dev/null || echo "no certificate yet"
+}
+
+[ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
+case "${1:-}" in
+  install) install_caddy ;;
+  setup) shift; setup "$@" ;;
+  status) status ;;
+  *) sed -n '2,7p' "$0"; exit 1 ;;
+esac

@@ -6,7 +6,7 @@ set -euo pipefail
 HOST="${1:?usage: deploy.sh user@host}"
 cd "$(dirname "$0")/.."
 
-git archive --format=tar HEAD app.py requirements.txt static deploy/karma-jar.service |
+git archive --format=tar HEAD app.py requirements.txt static deploy/karma-jar.service deploy/Caddyfile deploy/caddy.service deploy/karma-jar-https |
   ssh "$HOST" 'rm -rf /tmp/karma-deploy && mkdir -p /tmp/karma-deploy && tar -x -C /tmp/karma-deploy'
 ssh "$HOST" 'bash -s' <<'REMOTE'
 set -euo pipefail
@@ -23,6 +23,11 @@ tmp=/tmp/karma-deploy
 rm -rf /opt/karma-jar/static
 cp -r "$tmp/app.py" "$tmp/requirements.txt" "$tmp/static" /opt/karma-jar/
 install -m 644 "$tmp/deploy/karma-jar.service" /etc/systemd/system/karma-jar.service
+# HTTPS helper (Caddy + DuckDNS); see README "HTTPS"
+mkdir -p /opt/karma-jar/deploy
+install -m 644 "$tmp/deploy/Caddyfile" "$tmp/deploy/caddy.service" /opt/karma-jar/deploy/
+install -m 755 "$tmp/deploy/karma-jar-https" /usr/local/sbin/karma-jar-https
+[ -f /etc/caddy/Caddyfile ] && install -m 644 "$tmp/deploy/Caddyfile" /etc/caddy/Caddyfile && systemctl reload caddy 2>/dev/null || true
 rm -rf "$tmp"
 
 [ -x /opt/karma-jar/.venv/bin/python ] || python3 -m venv /opt/karma-jar/.venv
