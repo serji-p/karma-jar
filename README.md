@@ -205,6 +205,150 @@ docker compose down && rm -rf data && docker compose up -d
 (With systemd: `systemctl stop karma-jar`, then `rm -rf /var/lib/karma-jar/*`, then start it again.)
 If a parent forgets their PIN, another parent can set a new one under Settings.
 
+## 7. API: Home Assistant and AI agents
+
+Home Assistant automations and agents such as Claude Code or Duet can add chores through a small
+JSON API.
+
+**Get a token:** Settings → **API tokens** → **+ New token**. Give each caller its own token
+(e.g. "Home Assistant", "Claude Code"). The token is shown **once**, so copy it right away. Chores
+it creates show that name to kids and parents (🏠 for Home Assistant, 🤖 for anything else). Revoke
+a token from the same list at any time.
+
+A token can **only** read kids and open chores, create chores, and delete a still-open chore that
+it created itself. It can't touch money, consequences, approvals or users. Send it as
+`Authorization: Bearer kj_...` (or `X-Api-Key: kj_...`). The app is only reachable on your home
+network, so callers have to be at home (or on Tailscale, see section 3).
+
+| Call | What it does |
+|---|---|
+| `GET /api/ext` | Short self-description of the API (handy for agents) |
+| `GET /api/ext/kids` | Kids with jar balance, open chores and active consequences |
+| `GET /api/ext/chores` | Open chores; optional `?key=...` or `?kid=Ana` |
+| `POST /api/ext/chores` | Create a chore (body below) |
+| `DELETE /api/ext/chores/<id>` | Delete a chore this token created, while it's still to do |
+
+`POST /api/ext/chores` body (JSON). Only `title` is required.
+
+```json
+{
+  "title": "Refill the robot vacuum's clean water tank",
+  "kids": "Ana",
+  "reward": 0.5,
+  "due_in_minutes": 120,
+  "notes": "The tank is the one on the dock",
+  "together": false,
+  "key": "vacuum-clean-water"
+}
+```
+
+- `kids`: a name (any case), a list like `["Ana", "Ben"]`, `"Ana,Ben"`, or `"all"` (the default).
+  `together: true` makes it one shared chore that only counts once every kid has done it.
+- `due_in_minutes` sets a deadline from now. `due_at` takes an exact ISO 8601 time instead.
+- **`key` prevents duplicates.** While a chore with the same key is still open (to do, waiting
+  for a check, or sent back), the call creates nothing and returns the existing chore with
+  `"created": false`. After a parent approves it or marks it missed, the next call creates a new one.
+  That makes it safe for an automation to fire again and again.
+
+Quick test from any machine at home:
+
+```bash
+curl -s -X POST http://192.168.1.110:8080/api/ext/chores \
+  -H "Authorization: Bearer kj_YOUR_TOKEN" -H "Content-Type: application/json" \
+  -d '{"title": "Feed the cat", "kids": "Ben", "reward": 0.5, "due_in_minutes": 60}'
+```
+
+### Home Assistant: robot vacuum water tanks
+
+`configuration.yaml`:
+
+```yaml
+rest_command:
+  karma_jar_chore:
+    url: "http://192.168.1.110:8080/api/ext/chores"
+    method: post
+    headers:
+      Authorization: !secret karma_jar_auth
+    content_type: "application/json"
+    payload: >-
+      {"title": {{ title | tojson }},
+       "kids": {{ kids | default('all') | tojson }},
+       "reward": {{ reward | default(0) }},
+       "due_in_minutes": {{ due_in_minutes | default(120) }},
+       "together": {{ together | default(false) | tojson }},
+       "key": {{ key | default('') | tojson }}}
+```
+
+`secrets.yaml`:
+
+```yaml
+karma_jar_auth: "Bearer kj_YOUR_TOKEN"
+```
+
+Automations (Settings → Automations → ⋮ → Edit in YAML). Replace the entity IDs with your
+vacuum's: find them under Developer tools → States by searching for "water". Each integration
+names them differently, for example `..._water_shortage`, `..._water_box`, `..._dirty_water_box`
+or `..._mop_drying`.
+
+```yaml
+- alias: "Karma Jar: vacuum clean water tank empty"
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.robot_vacuum_water_shortage
+      to: "on"
+      for: "00:05:00"
+  actions:
+    - action: rest_command.karma_jar_chore
+      data:
+        title: "Refill the robot vacuum's clean water tank"
+        kids: "Ana"
+        reward: 0.5
+        due_in_minutes: 120
+        key: vacuum-clean-water
+
+- alias: "Karma Jar: vacuum dirty water tank full"
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.robot_vacuum_dirty_water_box_full
+      to: "on"
+      for: "00:05:00"
+  actions:
+    - action: rest_command.karma_jar_chore
+      data:
+        title: "Empty and rinse the robot vacuum's dirty water tank"
+        kids: "Ben"
+        reward: 0.5
+        due_in_minutes: 120
+        key: vacuum-dirty-water
+```
+
+Optional: a sensor showing how many chores are open, for a dashboard card.
+
+```yaml
+rest:
+  - resource: "http://192.168.1.110:8080/api/ext/chores"
+    headers:
+      Authorization: !secret karma_jar_auth
+    scan_interval: 300
+    sensor:
+      - name: "Karma Jar open chores"
+        value_template: "{{ value_json.count }}"
+```
+
+### AI agents (Claude Code, Duet, ...)
+
+Create a token named after the agent and give it to the agent as environment variables, for
+example `KARMA_JAR_URL=http://192.168.1.110:8080` and `KARMA_JAR_TOKEN=kj_...`. Then add this to the
+agent's instructions (for Claude Code, a `CLAUDE.md` or a skill):
+
+> To give the kids a chore in Karma Jar, call the API at `$KARMA_JAR_URL` with header
+> `Authorization: Bearer $KARMA_JAR_TOKEN`. Run `GET /api/ext` first to see the endpoints, and
+> `GET /api/ext/kids` for the kids' names. Create chores with `POST /api/ext/chores`
+> (`title`, `kids`, optional `reward` in dollars, `due_in_minutes`, `notes`, `together`). Use a
+> `key` when the same request might be repeated, and use `DELETE /api/ext/chores/<id>` to undo a
+> mistake. Keep titles short and kid-friendly. Parents approve the chores and handle money; the API
+> can't.
+
 ## Configuration
 
 | Variable | Default | Meaning |

@@ -9,6 +9,8 @@
   const money = (c) => (c < 0 ? "-" : "") + "$" + (Math.abs(c) / 100).toFixed(2);
   const money0 = (c) => (c % 100 === 0 ? (c < 0 ? "-" : "") + "$" + Math.abs(c / 100) : money(c));
   const initial = (n) => esc((n || "?").trim().charAt(0).toUpperCase());
+  // chores created through the API carry the token's name ("Home Assistant", "Claude Code", ...)
+  const sourcePill = (c) => (c.source ? `<span class="pill">${/home|assistant|\bha\b/i.test(c.source) ? "🏠" : "🤖"} ${esc(c.source)}</span>` : "");
   const COLORS = ["#FF6B9A", "#4DA3FF", "#33C48D", "#FF9F43", "#9B6BFF", "#FF5E5E", "#14B8C4", "#5B4BDB"];
 
   let serverOffset = 0; // serverTime - localTime
@@ -442,7 +444,7 @@
       if (c.status === "missed") return `<div class="card kid-chore done" style="border-left-color:#ccc"><div class="grow"><div class="title">${esc(c.title)}</div><div class="sub"><span class="pill">Missed</span></div></div></div>`;
       return `<div class="card kid-chore ${c.status === "denied" ? "denied" : ""}" style="--c:${me.color}">
           <div class="grow"><div class="title">${esc(c.title)}</div>
-          <div class="sub">${withPill}${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}</div>
+          <div class="sub">${withPill}${sourcePill(c)}${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}</div>
           ${c.notes ? `<div class="muted" style="margin-top:6px">${esc(c.notes)}</div>` : ""}
           ${c.status === "denied" ? `<div class="pill bad" style="margin-top:8px;white-space:normal">↩️ Try again${c.parent_note ? ": " + esc(c.parent_note) : ""}</div>` : ""}</div>
           <div class="right">${c.value_cents ? `<div class="value">${money0(c.value_cents)}</div>` : ""}<button class="btn good" data-done="${c.id}">I did it! ✋</button></div></div>`;
@@ -582,7 +584,7 @@
     if (actions && c.status === "submitted") act = `<div class="actions"><button class="btn good sm" data-approve="${c.id}">✓ Approve${c.value_cents ? " +" + money0(c.value_cents) + each(c) : ""}</button><button class="btn soft-bad sm" data-deny="${c.id}">✕ Send back</button></div>`;
     return `<div class="card item tap" data-chore="${c.id}" style="--c:${kidById(c.kid_id).color}"><div class="stripe" ${stripeStyle(c)}></div><div class="grow">
       <div class="row"><div class="title grow">${esc(c.title)}</div>${c.value_cents ? `<span class="pill money">${money0(c.value_cents)}${each(c)}</span>` : ""}</div>
-      <div class="sub">${who}${st}${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}
+      <div class="sub">${who}${st}${sourcePill(c)}${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}
         ${c.status === "submitted" && c.submitted_at ? `<span>done ${fmtDate(c.submitted_at)}</span>` : ""}</div>
       ${kidNotes}
       ${c.parent_note && c.status !== "submitted" ? `<div class="note">📝 ${esc(c.parent_note)}</div>` : ""}
@@ -675,6 +677,10 @@
       <div class="section-title">Parents</div><div class="list">${d.parents.map((p) => `<div class="card item tap" data-edituser="${p.id}"><div class="avatar" style="--c:${p.color}">${initial(p.name)}</div>
         <div class="grow"><div class="title">${esc(p.name)} ${p.id === d.me.id ? '<span class="pill brand">You</span>' : ""}</div><div class="sub">Change name or PIN</div></div><span class="muted">›</span></div>`).join("")}
         <button class="btn ghost" data-adduser="parent">+ Add parent</button></div>
+      <div class="section-title">API tokens</div><div class="list">${(d.tokens || []).map((t) => `<div class="card item"><div class="avatar" style="--c:#5B4BDB">🔑</div>
+        <div class="grow"><div class="title">${esc(t.name)}</div><div class="sub">${t.last_used_at ? "Last used " + fmtDate(t.last_used_at) : "Not used yet"}</div></div>
+        <button class="btn soft-bad sm" data-revoke="${t.id}">Revoke</button></div>`).join("")}
+        <button class="btn ghost" id="new-token">+ New token</button></div>
       <div class="section-title">This device</div>
       <div class="card"><p class="muted" style="margin-top:0">To install: open the browser menu and choose <b>Add to Home Screen</b> (iPhone/iPad: Share → Add to Home Screen).</p>
         <button class="btn soft-bad block" id="logout">Log out</button></div>
@@ -697,6 +703,12 @@
     }));
     $$("[data-edituser]").forEach((el) => (el.onclick = () => userForm([...d.kids, ...d.parents].find((u) => u.id == el.dataset.edituser))));
     $$("[data-adduser]").forEach((b) => (b.onclick = () => userForm(null, b.dataset.adduser)));
+    $$("[data-revoke]").forEach((b) => (b.onclick = async () => {
+      const t = (d.tokens || []).find((x) => x.id == b.dataset.revoke);
+      if (await confirmSheet(`Revoke ${esc(t.name)}?`, "Anything using this token stops working.", "Revoke"))
+        guard(null, async () => { await api("DELETE", `/api/tokens/${t.id}`); await refresh(); });
+    }));
+    const nt = $("#new-token"); if (nt) nt.onclick = tokenForm;
     const lo = $("#logout"); if (lo) lo.onclick = logout;
   }
 
@@ -863,6 +875,35 @@
         close(); toast("Saved", "good"); await refresh();
       });
     });
+  }
+
+  function tokenForm() {
+    sheet("New API token", `<label class="field"><span>Name</span><input class="input" id="tn" maxlength="40" value="Home Assistant"></label>
+      <div class="chips" style="margin:-6px 0 14px" id="tq">${["Home Assistant", "Claude Code", "Duet"].map((n) => `<button type="button" class="chip" data-n="${n}">${n}</button>`).join("")}</div>
+      <div class="sheet-actions"><button class="btn plain" data-close>Cancel</button><button class="btn" id="go">Create</button></div>`, (el, close) => {
+      $("#tq", el).onclick = (e) => { const b = e.target.closest("[data-n]"); if (b) $("#tn", el).value = b.dataset.n; };
+      $("#go", el).onclick = (e) => guard(e.currentTarget, async () => {
+        const r = await api("POST", "/api/tokens", { name: $("#tn", el).value });
+        close();
+        showToken(r);
+      });
+    });
+  }
+
+  function showToken(r) {
+    const copyBtn = (id) => `<button type="button" class="btn plain sm" data-copy="${id}">Copy</button>`;
+    sheet(`${esc(r.name)} token`, `<p class="muted" style="margin-top:0">Copy it now. It won't be shown again.</p>
+      <label class="field"><span>Token</span><div class="row"><input class="input grow" id="tok" readonly value="${esc(r.token)}">${copyBtn("tok")}</div></label>
+      <label class="field"><span>API address</span><div class="row"><input class="input grow" id="url" readonly value="${esc(location.origin)}/api/ext">${copyBtn("url")}</div></label>
+      <div class="sheet-actions"><button class="btn" data-close>Done</button></div>`, (el) => {
+      $$("[data-copy]", el).forEach((b) => (b.onclick = async () => {
+        const inp = $("#" + b.dataset.copy, el);
+        inp.select();
+        try { await navigator.clipboard.writeText(inp.value); } catch (_) { document.execCommand("copy"); } // clipboard API needs HTTPS
+        toast("Copied", "good");
+      }));
+    });
+    refresh().catch(() => {});
   }
 
   function userForm(u, role) {

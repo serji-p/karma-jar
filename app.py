@@ -2,6 +2,7 @@
 
 Single-file Flask backend with SQLite storage. Serves the static SPA from ./static.
 """
+import hashlib
 import os
 import sqlite3
 import secrets
@@ -68,7 +69,9 @@ CREATE TABLE IF NOT EXISTS chores (
     submitted_at TEXT,
     decided_at TEXT,
     decided_by INTEGER,
-    group_id INTEGER  -- "together" chores: one row per kid, same group_id
+    group_id INTEGER,  -- "together" chores: one row per kid, same group_id
+    ext_key TEXT,  -- set by API callers so repeated calls don't create duplicates
+    source TEXT NOT NULL DEFAULT ''  -- name of the API token that created it ('' = a parent)
 );
 CREATE TABLE IF NOT EXISTS punishments (
     id INTEGER PRIMARY KEY,
@@ -93,6 +96,13 @@ CREATE TABLE IF NOT EXISTS ledger (
     note TEXT NOT NULL DEFAULT '',
     created_by INTEGER,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,  -- sha256 of the token; the token itself is shown once
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chores_kid ON chores(kid_id, status);
 CREATE INDEX IF NOT EXISTS idx_ledger_kid ON ledger(kid_id);
@@ -144,10 +154,14 @@ def close_db(_exc):
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
-    for table in ("chores", "punishments"):  # migrate databases created before "together" existed
-        if "group_id" not in [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN group_id INTEGER")
+    # migrate databases created by older versions
+    for table, col, ddl in (("chores", "group_id", "INTEGER"), ("punishments", "group_id", "INTEGER"),
+                            ("chores", "ext_key", "TEXT"), ("chores", "source", "TEXT NOT NULL DEFAULT ''")):
+        if col not in [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+    for table in ("chores", "punishments"):
         conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_group ON {table}(group_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chores_ext_key ON chores(ext_key)")
     conn.commit()
     conn.close()
 
@@ -277,7 +291,8 @@ _rev_lock = threading.Lock()
 @app.after_request
 def bump_rev(resp):
     if (request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/")
-            and request.path not in ("/api/login", "/api/logout") and resp.status_code < 400):
+            and request.path not in ("/api/login", "/api/logout") and resp.status_code < 400
+            and not g.get("unchanged")):
         with _rev_lock:
             _rev["n"] += 1
     return resp
@@ -424,6 +439,7 @@ def data():
             (cutoff,),
         ),
         ledger=rows("SELECT * FROM ledger ORDER BY id DESC LIMIT 100"),
+        tokens=rows("SELECT id, name, created_at, last_used_at FROM api_tokens ORDER BY id"),
     )
 
 
@@ -473,20 +489,25 @@ def create_chore():
     if not kid_ids:
         abort(400, "Pick at least one kid")
     repeat = b.get("repeat") if b.get("repeat") in REPEATS else "none"
-    due = parse_dt(b.get("due_at"))
-    value = cents(b.get("value"))
+    insert_chores(kid_ids, title, clean(b.get("notes"), 500), cents(b.get("value")), parse_dt(b.get("due_at")),
+                  repeat, bool(b.get("together")), created_by=g.user["id"])
+    db().commit()
+    return jsonify(ok=True)
+
+
+def insert_chores(kid_ids, title, notes, value, due, repeat="none", together=False, created_by=None, ext_key=None, source=""):
     t = iso(now())
     ids = []
     for kid_id in kid_ids:
         get_kid(kid_id)
         ids.append(db().execute(
-            "INSERT INTO chores (kid_id, title, notes, value_cents, due_at, repeat, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (kid_id, title, clean(b.get("notes"), 500), value, iso(due), repeat, g.user["id"], t),
+            "INSERT INTO chores (kid_id, title, notes, value_cents, due_at, repeat, created_by, created_at, ext_key, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (kid_id, title, notes, value, iso(due), repeat, created_by, t, ext_key or None, source),
         ).lastrowid)
-    if b.get("together"):  # done together: only counts once every kid has marked it done
+    if together:  # done together: only counts once every kid has marked it done
         link_group("chores", ids)
-    db().commit()
-    return jsonify(ok=True)
+    return ids
 
 
 @app.put("/api/chores/<int:cid>")
@@ -745,6 +766,185 @@ def delete_ledger(lid):
     if e["kind"] not in ("payout", "bonus", "adjust"):
         abort(400, "Undo the chore or consequence instead")
     db().execute("DELETE FROM ledger WHERE id=?", (lid,))
+    db().commit()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- external API (Home Assistant, agents)
+# Token auth instead of the cookie session: "Authorization: Bearer kj_..." (or "X-Api-Key: kj_...").
+# Parents create and revoke tokens under Settings. A token can create, list and delete chores,
+# read kids and balances, and nothing else (no money, consequences or users).
+def hash_token(tok):
+    return hashlib.sha256(tok.encode()).hexdigest()
+
+
+def require_token(fn):
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        h = request.headers.get("Authorization", "")
+        tok = h[7:].strip() if h[:7].lower() == "bearer " else request.headers.get("X-Api-Key", "").strip()
+        t = one("SELECT * FROM api_tokens WHERE token_hash=?", (hash_token(tok),)) if tok else None
+        if not t:
+            abort(401, "Missing or invalid API token. Create one in Karma Jar under Settings -> API tokens.")
+        db().execute("UPDATE api_tokens SET last_used_at=? WHERE id=?", (iso(now()), t["id"]))
+        db().commit()
+        g.token = t
+        return fn(*a, **kw)
+    return wrapper
+
+
+def resolve_kids(v):
+    """Kids by name (any case), id, a comma-separated string, a list, or "all" (also the default)."""
+    kids = rows("SELECT id, name FROM users WHERE role='kid' ORDER BY id")
+    if v in (None, "", []):
+        v = "all"
+    items = v.split(",") if isinstance(v, str) else v if isinstance(v, list) else [v]
+    out = []
+    for it in items:
+        s = str(it).strip()
+        if not s:
+            continue
+        if s.lower() in ("all", "everyone", "both"):
+            out += [k["id"] for k in kids]
+            continue
+        k = next((k for k in kids if str(k["id"]) == s or k["name"].casefold() == s.casefold()), None)
+        if not k:
+            abort(400, f"No kid called '{s}'. Kids: {', '.join(k['name'] for k in kids)}")
+        out.append(k["id"])
+    if not out:
+        abort(400, "No kids to give the chore to")
+    return list(dict.fromkeys(out))
+
+
+def ext_chore(c):
+    return {"id": c["id"], "title": c["title"], "kid": c["kid_name"], "kid_id": c["kid_id"], "status": c["status"],
+            "reward": c["value_cents"] / 100, "due_at": c["due_at"], "key": c["ext_key"], "source": c["source"],
+            "together": bool(c["group_id"]), "created_at": c["created_at"]}
+
+
+EXT_HELP = {
+    "about": "Karma Jar API. Send the token as 'Authorization: Bearer <token>'. All bodies are JSON.",
+    "endpoints": {
+        "GET /api/ext/kids": "Kids with their jar balance, open chores and active consequences.",
+        "GET /api/ext/chores": "Open chores (to do, waiting for a check, sent back). Optional ?key=... or ?kid=Name.",
+        "POST /api/ext/chores": {
+            "title": "required, max 80 chars",
+            "kids": "names or ids: 'Ana', ['Ana','Ben'], 'Ana,Ben' or 'all' (default: all kids)",
+            "reward": "dollars, e.g. 0.5 (default 0)",
+            "due_in_minutes": "deadline from now, e.g. 120 (or due_at: ISO 8601 time)",
+            "notes": "optional text the kids see",
+            "together": "true = one shared chore that only counts once every kid has done it",
+            "key": "optional dedupe key, e.g. 'vacuum-clean-water'. While a chore with this key is still "
+                   "open, a new request with the same key creates nothing and returns the existing chore.",
+        },
+        "DELETE /api/ext/chores/<id>": "Delete a chore this same token created, while it is still to do.",
+    },
+}
+
+
+@app.get("/api/ext")
+@require_token
+def ext_help():
+    return jsonify(EXT_HELP)
+
+
+@app.get("/api/ext/kids")
+@require_token
+def ext_kids():
+    out = []
+    for k in rows("SELECT * FROM users WHERE role='kid' ORDER BY id"):
+        s = kid_summary(k)
+        out.append({
+            "id": k["id"], "name": k["name"], "balance": s["balance_cents"] / 100,
+            "jar_size": k["jar_size_cents"] / 100, "saving_for": k["goal_label"],
+            "open_chores": one("SELECT COUNT(*) n FROM chores WHERE kid_id=? AND status IN ('todo','submitted','denied')", (k["id"],))["n"],
+            "active_consequences": one("SELECT COUNT(*) n FROM punishments WHERE kid_id=? AND status='active' "
+                                       "AND (ends_at IS NULL OR ends_at > ?)", (k["id"], iso(now())))["n"],
+        })
+    return jsonify(kids=out)
+
+
+OPEN_CHORES_SQL = ("SELECT c.*, u.name AS kid_name FROM chores c JOIN users u ON u.id = c.kid_id "
+                   "WHERE c.status IN ('todo','submitted','denied')")
+
+
+@app.get("/api/ext/chores")
+@require_token
+def ext_list_chores():
+    sql, args = OPEN_CHORES_SQL, []
+    if request.args.get("key"):
+        sql += " AND c.ext_key = ?"
+        args.append(request.args["key"])
+    if request.args.get("kid"):
+        sql += " AND c.kid_id IN (%s)" % ",".join("?" * len(ids := resolve_kids(request.args["kid"])))
+        args += ids
+    chores = [ext_chore(c) for c in rows(sql + " ORDER BY c.due_at IS NULL, c.due_at, c.id", args)]
+    return jsonify(count=len(chores), chores=chores)
+
+
+@app.post("/api/ext/chores")
+@require_token
+def ext_create_chore():
+    b = body()
+    title = clean(b.get("title"), 80)
+    if not title:
+        abort(400, "title is required")
+    kid_ids = resolve_kids(b.get("kids", b.get("kid")))
+    key = clean(b.get("key"), 80)
+    if key:
+        existing = rows(OPEN_CHORES_SQL + " AND c.ext_key = ? ORDER BY c.id", (key,))
+        if existing:
+            g.unchanged = True  # nothing new: don't make every screen reload
+            return jsonify(ok=True, created=False, chores=[ext_chore(c) for c in existing])
+    if b.get("due_at"):
+        due = parse_dt(b.get("due_at"))
+    elif b.get("due_in_minutes") not in (None, ""):
+        due = now() + timedelta(minutes=max(0, min(to_int(b.get("due_in_minutes"), "due_in_minutes"), 60 * 24 * 60)))
+    else:
+        due = None
+    reward = b.get("reward", b.get("value"))
+    ids = insert_chores(kid_ids, title, clean(b.get("notes"), 500), cents(reward), due,
+                        together=bool(b.get("together")), ext_key=key, source=g.token["name"])
+    db().commit()
+    made = rows(OPEN_CHORES_SQL + " AND c.id IN (%s) ORDER BY c.id" % ",".join("?" * len(ids)), ids)
+    return jsonify(ok=True, created=True, chores=[ext_chore(c) for c in made]), 201
+
+
+@app.delete("/api/ext/chores/<int:cid>")
+@require_token
+def ext_delete_chore(cid):
+    c = chore_or_404(cid)
+    if c["source"] != g.token["name"]:
+        abort(403, "This token can only delete chores it created")
+    if c["status"] != "todo":
+        abort(400, "Only chores that are still to do can be deleted here")
+    for r in group_of("chores", c):
+        if r["status"] == "todo":
+            db().execute("DELETE FROM chores WHERE id=?", (r["id"],))
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/tokens")
+@require("parent")
+def create_token():
+    name = clean(body().get("name"), 40)
+    if not name:
+        abort(400, "Give the token a name, e.g. Home Assistant")
+    if one("SELECT 1 AS x FROM api_tokens WHERE name=?", (name,)):
+        abort(400, "A token with that name already exists")
+    tok = "kj_" + secrets.token_urlsafe(24)
+    db().execute("INSERT INTO api_tokens (name, token_hash, created_at) VALUES (?,?,?)", (name, hash_token(tok), iso(now())))
+    db().commit()
+    return jsonify(ok=True, name=name, token=tok)
+
+
+@app.delete("/api/tokens/<int:tid>")
+@require("parent")
+def delete_token(tid):
+    if not one("SELECT 1 AS x FROM api_tokens WHERE id=?", (tid,)):
+        abort(404)
+    db().execute("DELETE FROM api_tokens WHERE id=?", (tid,))
     db().commit()
     return jsonify(ok=True)
 
