@@ -624,7 +624,8 @@
       ${jarSVG(k.balance_cents / Math.max(k.jar_size_cents, 1), k.color, 80, 0, "card" + k.id)}
       <div style="font-weight:800">${esc(k.name)}</div>
       <div class="amt ${k.balance_cents < 0 ? "neg" : ""}">${money(k.balance_cents)}</div>
-      <div class="meta">${todo ? `<span class="pill">${todo} to do</span>` : ""}${pend ? `<span class="pill warn">${pend} to check</span>` : ""}${active ? `<span class="pill bad">${active} active</span>` : ""}</div></div>`;
+      <div class="chore-count ${todo ? "" : "none"}">🧹 ${todo ? `${todo} chore${todo === 1 ? "" : "s"}` : "No chores"}</div>
+      <div class="meta">${pend ? `<span class="pill warn">${pend} to check</span>` : ""}${active ? `<span class="pill bad">${active} active</span>` : ""}</div></div>`;
   }
 
   // --- tabs
