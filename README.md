@@ -42,6 +42,21 @@ Open `http://<vm-ip>:8080` from a phone on the home Wi-Fi and run the setup wiza
 
 ## 2. Alternative: systemd and a virtualenv (no Docker)
 
+**Quick way:** from a checkout on your PC, run
+
+```bash
+./deploy/deploy.sh root@192.168.1.110
+```
+
+It needs SSH key access to a Debian/Ubuntu VM or LXC container, and you can re-run it for every
+update. It installs `python3-venv` and `sqlite3`, creates a `karma` system user, copies the committed
+code to `/opt/karma-jar`, and installs `deploy/karma-jar.service`. The database lives in
+`/var/lib/karma-jar` and is never touched by redeploys. The script also adds a nightly backup to
+`/var/backups/karma-jar` that keeps 30 days (03:15 in the container's time zone, UTC by default).
+Extra settings such as `KARMA_SECURE_COOKIES=1` go in `/etc/default/karma-jar`.
+
+Manual steps, if you prefer to do it by hand:
+
 ```bash
 sudo apt install -y python3 python3-venv
 sudo useradd --system --home /opt/karma-jar --shell /usr/sbin/nologin karma

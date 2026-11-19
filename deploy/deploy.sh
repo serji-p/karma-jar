@@ -7,7 +7,8 @@ HOST="${1:?usage: deploy.sh user@host}"
 cd "$(dirname "$0")/.."
 
 git archive --format=tar HEAD app.py requirements.txt static deploy/karma-jar.service |
-  ssh "$HOST" 'bash -s' -- 3<&0 <<'REMOTE'
+  ssh "$HOST" 'rm -rf /tmp/karma-deploy && mkdir -p /tmp/karma-deploy && tar -x -C /tmp/karma-deploy'
+ssh "$HOST" 'bash -s' <<'REMOTE'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v sqlite3 >/dev/null || ! python3 -c 'import ensurepip' 2>/dev/null; then
@@ -18,7 +19,7 @@ mkdir -p /opt/karma-jar /var/lib/karma-jar /var/backups/karma-jar
 chown karma:karma /var/lib/karma-jar
 chmod 700 /var/lib/karma-jar
 
-tmp=$(mktemp -d); tar -x -C "$tmp" <&3
+tmp=/tmp/karma-deploy
 rm -rf /opt/karma-jar/static
 cp -r "$tmp/app.py" "$tmp/requirements.txt" "$tmp/static" /opt/karma-jar/
 install -m 644 "$tmp/deploy/karma-jar.service" /etc/systemd/system/karma-jar.service
@@ -37,5 +38,5 @@ systemctl enable -q karma-jar
 systemctl restart karma-jar
 sleep 2
 systemctl is-active karma-jar
-curl -fsS http://127.0.0.1:8080/api/state && echo
+python3 -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8080/api/state').read().decode())"
 REMOTE
