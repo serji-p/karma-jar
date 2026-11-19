@@ -131,6 +131,30 @@ Plain `http://192.168.x.x:8080` works, but the browser treats it as an ordinary 
 Choose **one** of the options below. Afterwards, set `KARMA_SECURE_COOKIES=1` (in
 `docker-compose.yml` or the systemd unit) and restart. That makes the login cookie HTTPS-only.
 
+### Option 0: DuckDNS + Caddy (what the systemd deploy sets up)
+
+A free DuckDNS name gives a real Let's Encrypt certificate that every device trusts, while the app
+stays private: the name points at the server's **home-network** address, and the certificate is
+issued through a DNS record (DNS challenge), so no port is opened on the router.
+
+`deploy/deploy.sh` installs the helper `karma-jar-https` on the server. On the server, as root:
+
+```
+karma-jar-https setup karmajar        # your DuckDNS subdomain; asks for the token (hidden)
+```
+
+It installs Caddy with the DuckDNS plugin (from caddyserver.com), offers to point
+`karmajar.duckdns.org` at the server's LAN IP, saves the token in `/etc/caddy/karma.env`
+(root-only), and waits for the certificate. Then open `https://karmajar.duckdns.org`.
+`karma-jar-https status` shows what is set up. Caddy renews the certificate by itself.
+
+- Use a DuckDNS subdomain that nothing else needs. If it already points at your home's public IP
+  for something else (remote Home Assistant), make a separate one.
+- If the name doesn't resolve at home, your router has **DNS rebinding protection** and drops
+  public names that point at private IPs. Add an exception for `duckdns.org` (or this name), or a
+  local DNS entry `karmajar.duckdns.org → <server IP>` in the router or Pi-hole.
+- The old `http://<server>:8080` address keeps working until you close it.
+
 ### Option A: Caddy with its own local CA (no domain needed)
 
 Run Caddy on the same VM in front of the app. It issues certificates from its own private CA.

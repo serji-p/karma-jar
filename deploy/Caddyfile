@@ -1,0 +1,12 @@
+# HTTPS in front of Karma Jar, with a real Let's Encrypt certificate obtained through
+# DuckDNS (DNS challenge). Nothing has to be reachable from the internet.
+# KARMA_DOMAIN and DUCKDNS_TOKEN come from /etc/caddy/karma.env (see karma-jar-https).
+{$KARMA_DOMAIN} {
+	tls {
+		dns duckdns {$DUCKDNS_TOKEN}
+		# check the challenge record on public DNS, not the home router
+		resolvers 1.1.1.1 8.8.8.8
+	}
+	encode gzip
+	reverse_proxy 127.0.0.1:8080
+}

@@ -1,0 +1,24 @@
+[Unit]
+Description=Caddy (HTTPS for Karma Jar)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/caddy/karma.env
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+EnvironmentFile=/etc/caddy/karma.env
+ExecStart=/usr/local/bin/caddy run --environ=false --config /etc/caddy/Caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
