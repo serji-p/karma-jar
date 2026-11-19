@@ -97,22 +97,31 @@
     [38, 112], [58, 111], [74, 112], [90, 110], [30, 103], [46, 103], [66, 103], [82, 102], [38, 95], [54, 94], [72, 95], [88, 94],
     [30, 86], [48, 86], [64, 86], [80, 86], [40, 78], [58, 77], [74, 78], [90, 77], [32, 69], [50, 69], [66, 68], [84, 69], [44, 61], [60, 60], [76, 61],
   ];
-  const levelY = (frac) => 142 - Math.max(0, Math.min(1, frac)) * 88; // 142 = bottom, 54 = top of fill
+  // 142 = bottom, 54 = top of fill. Any positive balance shows at least the bottom row of coins
+  // (otherwise a few dollars in a big jar hide behind the rounded bottom).
+  const levelY = (frac) => (frac <= 0 ? 146 : 142 - (0.07 + 0.93 * Math.min(1, frac)) * 88);
+  const jarMem = {}; // last rendered level per jar, so re-renders (polling) don't refill from empty
 
-  function jarSVG(frac, color, size = 120, fromFrac = null) {
+  function jarSVG(frac, color, size = 120, fromFrac = null, key = null) {
     const id = "jar" + ++jarSeq;
+    if (key) {
+      if ((fromFrac === null || fromFrac === 0) && key in jarMem) fromFrac = jarMem[key];
+      jarMem[key] = frac;
+    }
     const y = levelY(frac);
     const y0 = fromFrac === null ? y : levelY(fromFrac);
     const full = frac >= 1;
-    const coins = COINS.map(([x, cy]) => `<ellipse cx="${x}" cy="${cy}" rx="7.5" ry="3.6" fill="#E9A21A" stroke="#C47F06" stroke-width="1.2"/><ellipse cx="${x - 1.5}" cy="${cy - 1}" rx="3" ry="1.1" fill="#FFE39A" opacity=".8"/>`).join("");
+    // only coins that sit fully below the clip edge (level - 6); the higher of start/end level so a draining jar keeps its coins
+    const yTop = Math.min(y, y0);
+    const coins = COINS.filter(([, cy]) => cy >= yTop - 2.4).map(([x, cy]) => `<ellipse cx="${x}" cy="${cy}" rx="7.5" ry="3.6" fill="#E9A21A" stroke="#C47F06" stroke-width="1.2"/><ellipse cx="${x - 1.5}" cy="${cy - 1}" rx="3" ry="1.1" fill="#FFE39A" opacity=".8"/>`).join("");
     const wave = "M-120 4 Q-105 -1 -90 4 T-60 4 T-30 4 T0 4 T30 4 T60 4 T90 4 T120 4 T150 4 T180 4 V200 H-120 Z";
     return `<div class="jar" data-to="${y}" style="width:${size}px"><svg viewBox="0 0 120 150" width="${size}" height="${size * 1.25}" aria-hidden="true">
       <defs>
         <clipPath id="${id}c"><path d="${BODY}"/></clipPath>
-        <clipPath id="${id}b" clipPathUnits="userSpaceOnUse"><rect x="-200" y="3" width="500" height="300"/></clipPath>
+        <clipPath id="${id}b" clipPathUnits="userSpaceOnUse"><rect x="-200" y="-6" width="500" height="300"/></clipPath>
         <linearGradient id="${id}g" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#FFD66B"/><stop offset="1" stop-color="#F2A81E"/></linearGradient>
       </defs>
-      <path d="${BODY}" fill="#FFFFFF" opacity=".85"/>
+      <path d="${BODY}" fill="${frac < 0 ? "#FFE3E6" : "#FFFFFF"}" opacity=".85"/>
       <g clip-path="url(#${id}c)">
         <g class="level" style="transform:translateY(${y0}px)">
           <path class="wave2" d="${wave}" fill="#FFE7A3"/>
@@ -341,8 +350,10 @@
       const dots = $("#dots", el);
       const draw = () => { dots.innerHTML = Array.from({ length: Math.max(4, pin.length) }, (_, i) => `<i class="${i < pin.length ? "on" : ""}"></i>`).join(""); };
       draw();
+      let busy = false;
       const submit = async () => {
-        if (pin.length < 4) return;
+        if (pin.length < 4 || busy) return;
+        busy = true;
         try {
           await api("POST", "/api/login", { user_id: p.id, pin });
           close();
@@ -352,7 +363,7 @@
           $("#perr", el).textContent = e.message;
           dots.classList.remove("shake"); void dots.offsetWidth; dots.classList.add("shake");
           pin = ""; draw();
-        }
+        } finally { busy = false; }
       };
       $(".pinpad", el).onclick = (e) => {
         const b = e.target.closest("button"); if (!b) return;
@@ -390,10 +401,11 @@
     const d = S.data, me = d.me;
     const frac = me.balance_cents / Math.max(me.jar_size_cents, 1);
     const key = "kj-last-bal-" + me.id;
-    const lastBal = localStorage.getItem(key);
+    let lastBal = null;
+    try { lastBal = localStorage.getItem(key); } catch (_) { /* storage blocked */ }
     const prevFrac = lastBal === null ? 0 : Number(lastBal) / Math.max(me.jar_size_cents, 1);
     const delta = lastBal === null ? 0 : me.balance_cents - Number(lastBal);
-    localStorage.setItem(key, me.balance_cents);
+    try { localStorage.setItem(key, me.balance_cents); } catch (_) { /* storage blocked */ }
 
     const open = d.chores.filter((c) => ["todo", "denied"].includes(c.status));
     const waiting = d.chores.filter((c) => c.status === "submitted");
@@ -423,8 +435,8 @@
         <div class="emoji">${PUN_EMOJI(p.title)}</div>
         <div class="grow"><div class="title">${esc(p.title)}</div>
           ${p.reason ? `<div class="muted">${esc(p.reason)}</div>` : ""}
-          <div class="row" style="margin-top:6px;gap:6px;flex-wrap:wrap">${p.fine_cents ? `<span class="pill bad">−${money0(p.fine_cents)} from jar</span>` : ""}${p.status === "cancelled" ? `<span class="pill good">Cancelled</span>` : ""}</div></div>
-        ${p.duration_minutes ? (isActive ? `<div class="timer" data-ends="${p.ends_at}">${fmtDur(new Date(p.ends_at) - nowMs())} left</div>` : `<div class="timer">Over ✓</div>`) : ""}
+          <div class="row" style="margin-top:6px;gap:6px;flex-wrap:wrap">${p.status === "cancelled" ? `<span class="pill good">Cancelled${p.fine_cents ? " · " + money0(p.fine_cents) + " back in jar" : ""}</span>` : p.fine_cents ? `<span class="pill bad">−${money0(p.fine_cents)} from jar</span>` : ""}</div></div>
+        ${p.duration_minutes && p.status !== "cancelled" ? (isActive ? `<div class="timer" data-ends="${p.ends_at}">${fmtDur(new Date(p.ends_at) - nowMs())} left</div>` : `<div class="timer">Over ✓</div>`) : ""}
       </div>`;
     };
 
@@ -435,7 +447,7 @@
       <div class="kid-top"><div class="avatar" style="--c:${me.color}">${initial(me.name)}</div><h1>Hi ${esc(me.name)}! 👋</h1><button class="btn plain sm" id="logout">Switch user</button></div>
       <div class="kid-grid">
         <div class="card kid-jar-card">
-          <div style="display:flex;justify-content:center" id="bigjar">${jarSVG(frac, me.color, 210, delta ? prevFrac : 0)}</div>
+          <div style="display:flex;justify-content:center" id="bigjar">${jarSVG(frac, me.color, 210, delta ? prevFrac : 0, "big" + me.id)}</div>
           <div class="amt ${me.balance_cents < 0 ? "neg" : ""}">${money(me.balance_cents)}</div>
           <div class="goal">${me.balance_cents < 0 ? "Your jar is in the red. Do chores to fill it back up!" : frac >= 1 ? "🎉 Your jar is FULL!" : goalText}</div>
           <div class="progress"><i style="width:${Math.max(0, Math.min(100, frac * 100))}%"></i></div>
@@ -537,7 +549,7 @@
     return `<div class="card item tap" data-pun="${p.id}" style="--c:${k.color}"><div class="stripe"></div><div class="grow">
       <div class="row"><div class="title grow">${PUN_EMOJI(p.title)} ${esc(p.title)}</div>${active ? `<span class="pill bad timer" data-ends="${p.ends_at}">${fmtDur(new Date(p.ends_at) - nowMs())} left</span>` : ""}</div>
       <div class="sub"><b style="color:var(--ink)">${esc(k.name)}</b>
-        ${p.fine_cents ? `<span class="pill bad">−${money0(p.fine_cents)}</span>` : ""}
+        ${p.fine_cents ? (p.status === "cancelled" ? `<span class="pill good">${money0(p.fine_cents)} refunded</span>` : `<span class="pill bad">−${money0(p.fine_cents)}</span>`) : ""}
         ${p.duration_minutes ? `<span class="pill">⏱ ${fmtMinutes(p.duration_minutes)}</span>` : ""}
         ${p.status === "cancelled" ? `<span class="pill good">Cancelled</span>` : !active ? `<span class="pill">${p.duration_minutes ? "Ended" : "Applied"}</span>` : ""}
         <span>${fmtDate(p.created_at)}</span></div>
@@ -549,7 +561,7 @@
     const pend = S.data.chores.filter((c) => c.kid_id === k.id && c.status === "submitted").length;
     const todo = S.data.chores.filter((c) => c.kid_id === k.id && ["todo", "denied"].includes(c.status)).length;
     return `<div class="card kid-card tap" data-kidcard="${k.id}" style="--c:${k.color}">
-      ${jarSVG(k.balance_cents / Math.max(k.jar_size_cents, 1), k.color, 80, 0)}
+      ${jarSVG(k.balance_cents / Math.max(k.jar_size_cents, 1), k.color, 80, 0, "card" + k.id)}
       <div style="font-weight:800">${esc(k.name)}</div>
       <div class="amt ${k.balance_cents < 0 ? "neg" : ""}">${money(k.balance_cents)}</div>
       <div class="meta">${todo ? `<span class="pill">${todo} to do</span>` : ""}${pend ? `<span class="pill warn">${pend} to check</span>` : ""}${active ? `<span class="pill bad">${active} active</span>` : ""}</div></div>`;
@@ -598,7 +610,7 @@
     return d.kids.map((k) => {
       const led = d.ledger.filter((e) => e.kid_id === k.id).slice(0, 12);
       return `<div class="card money-card" style="margin-bottom:14px;border-top:6px solid ${k.color}">
-        <div class="row">${jarSVG(k.balance_cents / Math.max(k.jar_size_cents, 1), k.color, 64, 0)}<div class="grow"><div style="font-weight:800">${esc(k.name)}'s jar</div>
+        <div class="row">${jarSVG(k.balance_cents / Math.max(k.jar_size_cents, 1), k.color, 64, 0, "money" + k.id)}<div class="grow"><div style="font-weight:800">${esc(k.name)}'s jar</div>
           <div class="big" style="color:${k.balance_cents < 0 ? "var(--bad)" : "var(--ink)"}">${money(k.balance_cents)}</div><div class="muted small">waiting to be paid${k.goal_label ? " · saving for " + esc(k.goal_label) : ""}</div></div></div>
         <div class="stats"><div><b>${money0(k.earned_cents)}</b><span>Earned</span></div><div><b>${money0(k.paid_cents)}</b><span>Paid out</span></div><div><b>${money0(k.fined_cents)}</b><span>Fines</span></div></div>
         <div class="row"><button class="btn good grow" data-pay="${k.id}" ${k.balance_cents <= 0 ? "disabled" : ""}>💵 Mark as paid</button><button class="btn plain" data-adjust="${k.id}">🎁 Bonus / adjust</button></div>
@@ -688,8 +700,8 @@
     const d = new Date(nowMs());
     if (kind === "tonight") { d.setHours(20, 0, 0, 0); if (d < nowMs()) d.setDate(d.getDate() + 1); }
     if (kind === "tomorrow") { d.setDate(d.getDate() + 1); d.setHours(18, 0, 0, 0); }
-    if (kind === "weekend") { const add = (6 - d.getDay() + 7) % 7 || 7; d.setDate(d.getDate() + add); d.setHours(12, 0, 0, 0); }
-    if (kind === "week") { const add = (7 - d.getDay()) % 7 || 7; d.setDate(d.getDate() + add); d.setHours(20, 0, 0, 0); }
+    if (kind === "weekend") { let add = (6 - d.getDay() + 7) % 7; if (!add && d.getHours() >= 12) add = 7; d.setDate(d.getDate() + add); d.setHours(12, 0, 0, 0); }
+    if (kind === "week") { let add = (7 - d.getDay()) % 7; if (!add && d.getHours() >= 20) add = 7; d.setDate(d.getDate() + add); d.setHours(20, 0, 0, 0); }
     return toLocalInput(d.toISOString());
   }
 

@@ -5,11 +5,13 @@ Single-file Flask backend with SQLite storage. Serves the static SPA from ./stat
 import os
 import sqlite3
 import secrets
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from flask import Flask, g, jsonify, request, session, send_from_directory, abort
+from werkzeug.exceptions import HTTPException
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -242,32 +244,49 @@ def kid_summary(kid):
     return k
 
 
-# lightweight brute-force protection for PINs (per user, in memory)
+# lightweight brute-force protection for PINs (per user, in memory - hence ONE gunicorn worker).
+# Every attempt is counted *before* the slow hash check, under a lock, so parallel requests
+# can't slip past the limit. A correct PIN clears the counter.
 _fails = {}
+_fails_lock = threading.Lock()
 
 
-def check_lock(uid):
-    f = _fails.get(uid)
-    if f and f["until"] > time.time():
-        abort(429, f"Too many tries. Wait {int(f['until'] - time.time()) + 1}s")
+def claim_attempt(uid):
+    with _fails_lock:
+        f = _fails.setdefault(uid, {"count": 0, "until": 0})
+        if f["until"] > time.time():
+            abort(429, f"Too many tries. Wait {int(f['until'] - time.time()) + 1}s")
+        f["count"] += 1
+        if f["count"] >= 5:
+            f["until"] = time.time() + 30 * (2 ** min(f["count"] - 5, 5))
 
 
-def note_fail(uid):
-    f = _fails.setdefault(uid, {"count": 0, "until": 0})
-    f["count"] += 1
-    if f["count"] >= 5:
-        f["until"] = time.time() + 30 * (2 ** min(f["count"] - 5, 5))
-
-
-@app.errorhandler(400)
-@app.errorhandler(401)
-@app.errorhandler(403)
-@app.errorhandler(404)
-@app.errorhandler(429)
+@app.errorhandler(HTTPException)
 def json_error(e):
     if request.path.startswith("/api/"):
-        return jsonify(error=getattr(e, "description", str(e))), e.code
+        return jsonify(error=e.description or e.name), e.code
     return e
+
+
+@app.errorhandler(Exception)
+def json_crash(e):
+    app.logger.exception("Unhandled error")
+    if request.path.startswith("/api/"):
+        return jsonify(error="Something went wrong"), 500
+    return "Internal error", 500
+
+
+def to_int(v, what="id"):
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        abort(400, f"Bad {what}")
+
+
+def id_list(v):
+    if not isinstance(v, list):
+        abort(400, "Pick at least one kid")
+    return list(dict.fromkeys(to_int(x) for x in v))
 
 
 # ---------------------------------------------------------------- auth / setup
@@ -314,13 +333,13 @@ def profiles():
 @app.post("/api/login")
 def login():
     b = body()
-    uid = int(b.get("user_id") or 0)
-    check_lock(uid)
+    uid = to_int(b.get("user_id"))
+    claim_attempt(uid)
     u = one("SELECT * FROM users WHERE id = ?", (uid,))
     if not u or not check_password_hash(u["pin_hash"], str(b.get("pin") or "")):
-        note_fail(uid)
         abort(401, "Wrong PIN")
-    _fails.pop(uid, None)
+    with _fails_lock:
+        _fails.pop(uid, None)
     session.permanent = True
     session["uid"] = u["id"]
     return jsonify(me=public_user(u))
@@ -391,7 +410,7 @@ def create_chore():
     title = clean(b.get("title"), 80)
     if not title:
         abort(400, "Title required")
-    kid_ids = [int(k) for k in (b.get("kid_ids") or [])]
+    kid_ids = id_list(b.get("kid_ids") or [])
     if not kid_ids:
         abort(400, "Pick at least one kid")
     repeat = b.get("repeat") if b.get("repeat") in REPEATS else "none"
@@ -490,7 +509,8 @@ def approve_chore(cid):
     )
     if value:
         ledger_add(c["kid_id"], value, "chore", c["title"], cid)
-    spawn_next(c)
+    if c["status"] != "missed":  # "missed" already scheduled the next copy
+        spawn_next(c)
     db().commit()
     return jsonify(ok=True)
 
@@ -499,8 +519,8 @@ def approve_chore(cid):
 @require("parent")
 def deny_chore(cid):
     c = chore_or_404(cid)
-    if c["status"] == "approved":
-        abort(400, "Already approved")
+    if c["status"] not in ("todo", "submitted", "denied"):
+        abort(400, "This chore is already finished")
     db().execute(
         "UPDATE chores SET status='denied', decided_at=?, decided_by=?, parent_note=? WHERE id=?",
         (iso(now()), g.user["id"], clean(body().get("note"), 300), cid),
@@ -513,8 +533,8 @@ def deny_chore(cid):
 @require("parent")
 def missed_chore(cid):
     c = chore_or_404(cid)
-    if c["status"] == "approved":
-        abort(400, "Already approved")
+    if c["status"] not in ("todo", "submitted", "denied"):
+        abort(400, "This chore is already finished")
     db().execute(
         "UPDATE chores SET status='missed', decided_at=?, decided_by=?, parent_note=? WHERE id=?",
         (iso(now()), g.user["id"], clean(body().get("note"), 300), cid),
@@ -539,7 +559,7 @@ def create_punishment():
     title = clean(b.get("title"), 80)
     if not title:
         abort(400, "Title required")
-    kid_ids = [int(k) for k in (b.get("kid_ids") or [])]
+    kid_ids = id_list(b.get("kid_ids") or [])
     if not kid_ids:
         abort(400, "Pick at least one kid")
     fine = cents(b.get("fine"))
@@ -568,7 +588,8 @@ def create_punishment():
 @app.post("/api/punishments/<int:pid>/end")
 @require("parent")
 def end_punishment(pid):
-    pun_or_404(pid)
+    if pun_or_404(pid)["status"] != "active":
+        abort(400, "It's not active")
     db().execute("UPDATE punishments SET status='ended', ends_at=? WHERE id=?", (iso(now()), pid))
     db().commit()
     return jsonify(ok=True)
@@ -578,8 +599,10 @@ def end_punishment(pid):
 @require("parent")
 def extend_punishment(pid):
     p = pun_or_404(pid)
-    minutes = int(body().get("minutes") or 0)
-    base = parse_dt(p["ends_at"]) if p["status"] == "active" and p["ends_at"] else now()
+    if p["status"] != "active" or not p["ends_at"]:
+        abort(400, "It's not active")
+    minutes = to_int(body().get("minutes"), "minutes")
+    base = parse_dt(p["ends_at"])
     new_end = base + timedelta(minutes=minutes)
     if new_end <= now():
         db().execute("UPDATE punishments SET status='ended', ends_at=? WHERE id=?", (iso(now()), pid))
@@ -597,6 +620,8 @@ def extend_punishment(pid):
 def cancel_punishment(pid):
     """Cancel = it never happened: removes it and refunds the fine."""
     p = pun_or_404(pid)
+    if p["status"] == "cancelled":
+        abort(400, "Already cancelled")
     if p["fine_cents"]:
         ledger_add(p["kid_id"], p["fine_cents"], "refund", f"Cancelled: {p['title']}", pid)
     db().execute("UPDATE punishments SET status='cancelled', ends_at=COALESCE(ends_at, ?) WHERE id=?", (iso(now()), pid))
@@ -609,7 +634,7 @@ def cancel_punishment(pid):
 @require("parent")
 def payout():
     b = body()
-    kid = get_kid(int(b.get("kid_id") or 0))
+    kid = get_kid(to_int(b.get("kid_id")))
     amount = cents(b.get("amount"))
     if not amount:
         abort(400, "Nothing to pay")
@@ -622,7 +647,7 @@ def payout():
 @require("parent")
 def adjust():
     b = body()
-    kid = get_kid(int(b.get("kid_id") or 0))
+    kid = get_kid(to_int(b.get("kid_id")))
     amount = cents(b.get("amount"), allow_negative=True)
     if not amount:
         abort(400, "Amount required")

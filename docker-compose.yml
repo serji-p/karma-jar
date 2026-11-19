@@ -9,3 +9,5 @@ services:
       - ./data:/data
     environment:
       - TZ=America/New_York
+      # Uncomment once the app is served over HTTPS (see README):
+      # - KARMA_SECURE_COOKIES=1
