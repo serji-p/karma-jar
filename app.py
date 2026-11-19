@@ -531,12 +531,70 @@ def edit_chore(cid):
     b = body()
     title = clean(b.get("title"), 80) or c["title"]
     repeat = b.get("repeat") if b.get("repeat") in REPEATS else c["repeat"]
+    ids = [r["id"] for r in group_of("chores", c)]
+    if "kid_ids" in b or "mode" in b or "together" in b:
+        ids = regroup_chore(c, b)
     db().execute(
-        "UPDATE chores SET title=?, notes=?, value_cents=?, due_at=?, repeat=? WHERE id=? OR (group_id IS NOT NULL AND group_id=?)",
-        (title, clean(b.get("notes"), 500), cents(b.get("value")), iso(parse_dt(b.get("due_at"))), repeat, cid, c["group_id"]),
+        f"UPDATE chores SET title=?, notes=?, value_cents=?, due_at=?, repeat=? WHERE id IN ({','.join('?' * len(ids))})",
+        (title, clean(b.get("notes"), 500), cents(b.get("value")), iso(parse_dt(b.get("due_at"))), repeat, *ids),
     )
     db().commit()
     return jsonify(ok=True)
+
+
+def regroup_chore(c, b):
+    """Change who a chore is for and how it's shared (each / together / first). A kid who already
+    marked it done can't be taken off. Returns the ids of the chore's rows afterwards."""
+    grp = group_of("chores", c)
+    by_kid = {r["kid_id"]: r for r in grp}
+    kid_ids = id_list(b.get("kid_ids")) if "kid_ids" in b else list(by_kid)
+    if not kid_ids:
+        abort(400, "Pick at least one kid")
+    for k in kid_ids:
+        get_kid(k)
+    if "mode" in b or "together" in b:
+        mode = chore_mode(b)
+    else:
+        mode = c["group_mode"] if c["group_id"] else "each"
+    if len(kid_ids) < 2:
+        mode = "each"
+
+    def done(r):
+        return r["status"] in ("submitted", "approved")
+
+    def names(rs):
+        return " & ".join(get_kid(r["kid_id"])["name"] for r in rs)
+
+    dropped = [r for r in grp if r["kid_id"] not in kid_ids]
+    if any(done(r) for r in dropped):
+        abort(400, f"{names([r for r in dropped if done(r)])} already did it, so can't be taken off")
+    kept = [r for r in grp if r["kid_id"] in kid_ids]
+    did = [r for r in kept if done(r)]
+    if mode == "first" and len(did) > 1:
+        abort(400, f"{names(did)} already did it, so it can't be first-one-gets-it")
+
+    for r in dropped:
+        db().execute("DELETE FROM chores WHERE id=?", (r["id"],))
+    ids = [r["id"] for r in kept]
+    for k in kid_ids:
+        if k not in by_kid:
+            ids.append(db().execute(
+                "INSERT INTO chores (kid_id, title, notes, value_cents, due_at, repeat, created_by, created_at, ext_key, source) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (k, c["title"], c["notes"], c["value_cents"], c["due_at"], c["repeat"], c["created_by"], iso(now()),
+                 c["ext_key"], c["source"]),
+            ).lastrowid)
+    ids.sort()
+    marks = ",".join("?" * len(ids))
+    if mode == "each":
+        db().execute(f"UPDATE chores SET group_id=NULL WHERE id IN ({marks})", ids)
+    else:
+        db().execute(f"UPDATE chores SET group_id=?, group_mode=? WHERE id IN ({marks})", (ids[0], mode, *ids))
+    # "taken" only exists in first mode: for every kid except the one who already did it
+    db().execute(f"UPDATE chores SET status='todo' WHERE status='taken' AND id IN ({marks})", ids)
+    if mode == "first" and did:
+        db().execute(f"UPDATE chores SET status='taken' WHERE status IN ('todo','denied') AND id IN ({marks})", ids)
+    return ids
 
 
 @app.delete("/api/chores/<int:cid>")

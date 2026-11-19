@@ -22,6 +22,8 @@ for a year, and "Switch user" goes back to the profile picker.
   "I did it!". Each kid sees whether the others are done yet. Approving it pays every kid the
   reward, and sending it back, marking it missed, editing or deleting it applies to all of them.
   A repeating together chore schedules its next copy for everyone.
+- **Editing** a chore lets you change who it's for and how it's shared. Switching to "Each on their
+  own" splits it into separate chores. A kid who already marked it done can't be taken off it.
 - A **together consequence** is a single item for the parent: extending, shortening, ending or
   cancelling it acts on all the kids, and cancelling refunds every kid's fine.
 

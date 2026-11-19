@@ -356,6 +356,47 @@ class Flow(unittest.TestCase):
                                          headers={"Authorization": f"Bearer {tok}"})
         self.assertEqual({c["mode"] for c in r.json["chores"]}, {"first"})
 
+    def test_23_edit_kids_and_mode(self):
+        q = lambda: {r["kid_id"]: r for r in self.sql("SELECT * FROM chores WHERE title='Water plants' ORDER BY id")}
+        put = lambda cid, **kw: self.parent.put(f"/api/chores/{cid}", json={"title": "Water plants", "value": 2, **kw})
+        self.parent.post("/api/chores", json={"title": "Water plants", "kid_ids": [self.ana], "value": 2})
+        a = q()[self.ana]["id"]
+        # plain edit without kid_ids keeps things as they were
+        self.assertEqual(put(a, notes="hi").status_code, 200)
+        self.assertEqual(list(q()), [self.ana])
+        # add Ben, together
+        self.assertEqual(put(a, kid_ids=[self.ana, self.ben], mode="together").status_code, 200)
+        rows = q()
+        self.assertEqual(set(rows), {self.ana, self.ben})
+        self.assertEqual({(r["group_id"], r["group_mode"], r["value_cents"], r["notes"]) for r in rows.values()}, {(a, "together", 200, "")})
+        b = rows[self.ben]["id"]
+        # switch to first-one after Ana already did it: Ben's row becomes taken
+        self.kid.post(f"/api/chores/{a}/submit")
+        self.assertEqual(put(b, kid_ids=[self.ana, self.ben], mode="first").status_code, 200)
+        self.assertEqual({k: r["status"] for k, r in q().items()}, {self.ana: "submitted", self.ben: "taken"})
+        # back to together: Ben has to do it too
+        put(a, kid_ids=[self.ana, self.ben], mode="together")
+        self.assertEqual(q()[self.ben]["status"], "todo")
+        # Ana already did it, so she can't be removed
+        r = put(a, kid_ids=[self.ben])
+        self.assertEqual((r.status_code, r.json["error"]), (400, "Ana already did it, so can't be taken off"))
+        # both did it -> can't become first-one
+        self.kid2.post(f"/api/chores/{b}/submit")
+        self.assertEqual(put(a, kid_ids=[self.ana, self.ben], mode="first").status_code, 400)
+        # split into separate chores
+        self.assertEqual(put(a, kid_ids=[self.ana, self.ben], mode="each").status_code, 200)
+        self.assertEqual({r["group_id"] for r in q().values()}, {None})
+        # each chore is on its own now: editing Ben's leaves Ana's alone
+        self.kid.post(f"/api/chores/{a}/undo")
+        self.assertEqual(put(b, kid_ids=[self.ben]).status_code, 200)  # b is now its own chore; Ana's stays separate
+        self.assertEqual(set(q()), {self.ana, self.ben})
+        # bad kid lists
+        self.assertEqual(put(a, kid_ids=[999]).status_code, 404)
+        self.assertEqual(put(a, kid_ids=[]).status_code, 400)
+        # move Ana's chore to Ben: Ana's row goes, Ben gets a new one
+        self.assertEqual(put(a, kid_ids=[self.ben]).status_code, 200)
+        self.assertEqual(len(self.sql("SELECT * FROM chores WHERE title='Water plants' AND kid_id=?", (self.ana,))), 0)
+
     def test_99_last_parent_protected(self):
         self.assertEqual(self.parent.delete(f"/api/users/{self.dad}").status_code, 200)
         me = self.parent.get("/api/state").json["me"]["id"]
