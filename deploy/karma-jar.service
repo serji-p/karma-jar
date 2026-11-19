@@ -1,0 +1,23 @@
+[Unit]
+Description=Karma Jar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=karma
+Group=karma
+WorkingDirectory=/opt/karma-jar
+Environment=KARMA_DATA_DIR=/var/lib/karma-jar
+EnvironmentFile=-/etc/default/karma-jar
+# One worker only: the PIN lockout is in memory and SQLite wants a single writer.
+ExecStart=/opt/karma-jar/.venv/bin/gunicorn -w 1 --threads 8 -b 0.0.0.0:8080 --access-logfile - app:app
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/karma-jar
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
