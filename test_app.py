@@ -311,6 +311,51 @@ class Flow(unittest.TestCase):
         self.assertEqual(ext.get("/api/ext/kids", headers=h).status_code, 401)
         self.assertEqual(ext.get("/api/ext/kids", headers={"Authorization": f"Bearer {agent}"}).status_code, 200)
 
+    def test_21_first_one_chore(self):
+        self.parent.post("/api/chores", json={"title": "Unload dishwasher", "kid_ids": [self.ana, self.ben], "value": 1, "mode": "first"})
+        rows = {r["kid_id"]: r for r in self.sql("SELECT * FROM chores WHERE title='Unload dishwasher'")}
+        self.assertEqual({r["group_mode"] for r in rows.values()}, {"first"})
+        a, b = rows[self.ana]["id"], rows[self.ben]["id"]
+        ben_sees = lambda: any(x["title"] == "Unload dishwasher" for x in self.kid2.get("/api/data").json["chores"])
+        self.assertTrue(ben_sees())
+        # Ana does it first: it disappears for Ben, and Ben can't claim it any more
+        self.assertEqual(self.kid.post(f"/api/chores/{a}/submit").status_code, 200)
+        self.assertFalse(ben_sees())
+        r = self.kid2.post(f"/api/chores/{b}/submit")
+        self.assertEqual((r.status_code, r.json["error"]), (400, "Ana already did this one!"))
+        # undo -> back for Ben
+        self.kid.post(f"/api/chores/{a}/undo")
+        self.assertTrue(ben_sees())
+        # Ben does it, parent sends it back -> open for both again, Ben sees the note
+        self.kid2.post(f"/api/chores/{b}/submit")
+        self.parent.post(f"/api/chores/{a}/deny", json={"note": "plates still inside"})  # any id of the group works
+        st = {r["kid_id"]: r["status"] for r in self.sql("SELECT kid_id, status FROM chores WHERE title='Unload dishwasher'")}
+        self.assertEqual(st, {self.ana: "todo", self.ben: "denied"})
+        # Ana does it this time; approving pays only Ana
+        a_bal, b_bal = self.bal(self.ana), self.bal(self.ben)
+        self.kid.post(f"/api/chores/{a}/submit")
+        self.assertEqual(self.parent.post(f"/api/chores/{b}/approve", json={}).status_code, 200)
+        self.assertEqual((self.bal(self.ana), self.bal(self.ben)), (a_bal + 100, b_bal))
+        self.assertFalse(ben_sees())
+        self.assertEqual(self.parent.post(f"/api/chores/{a}/approve", json={}).status_code, 400)
+        # parent's list still shows the finished chore once, as Ana's
+        mine = [x for x in self.parent.get("/api/data").json["chores"] if x["title"] == "Unload dishwasher"]
+        self.assertEqual(sorted(x["status"] for x in mine), ["approved", "taken"])
+
+    def test_22_first_one_race_and_api(self):
+        from concurrent.futures import ThreadPoolExecutor
+        self.parent.post("/api/chores", json={"title": "Race chore", "kid_ids": [self.ana, self.ben], "mode": "first"})
+        rows = {r["kid_id"]: r["id"] for r in self.sql("SELECT * FROM chores WHERE title='Race chore'")}
+        with ThreadPoolExecutor(2) as ex:
+            codes = list(ex.map(lambda p: p[0].post(f"/api/chores/{p[1]}/submit").status_code,
+                                [(self.kid, rows[self.ana]), (self.kid2, rows[self.ben])]))
+        self.assertEqual(sorted(codes), [200, 400], "exactly one kid wins")
+        self.assertEqual(sorted(r["status"] for r in self.sql("SELECT status FROM chores WHERE title='Race chore'")), ["submitted", "taken"])
+        tok = self.parent.post("/api/tokens", json={"name": "Duet"}).json["token"]
+        r = karma.app.test_client().post("/api/ext/chores", json={"title": "Take out recycling", "kids": "all", "mode": "first"},
+                                         headers={"Authorization": f"Bearer {tok}"})
+        self.assertEqual({c["mode"] for c in r.json["chores"]}, {"first"})
+
     def test_99_last_parent_protected(self):
         self.assertEqual(self.parent.delete(f"/api/users/{self.dad}").status_code, 200)
         me = self.parent.get("/api/state").json["me"]["id"]

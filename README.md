@@ -12,8 +12,13 @@ On first start the app shows a setup wizard where you create one parent and the 
 **Only parents have a PIN (4–8 digits).** Kids just tap their own profile. Devices stay logged in
 for a year, and "Switch user" goes back to the profile picker.
 
-**Together:** pick two or more kids and choose 🤝 Together.
-- A **together chore** only goes to the parent for review once every kid in it has tapped
+**Shared chores:** pick two or more kids and choose how they share it.
+- **Each on their own:** every kid gets their own copy (the default).
+- **🏃 First one to do it:** whoever taps "I did it!" first claims it, and it disappears from
+  the other kids' screens within a few seconds. Only that kid gets the reward. If they undo it, or
+  a parent sends it back, it's open to everyone again. If two kids tap at the same moment, only one
+  of them gets it.
+- **🤝 Together, all must finish:** a **together chore** only goes to the parent for review once every kid in it has tapped
   "I did it!". Each kid sees whether the others are done yet. Approving it pays every kid the
   reward, and sending it back, marking it missed, editing or deleting it applies to all of them.
   A repeating together chore schedules its next copy for everyone.
@@ -237,13 +242,17 @@ network, so callers have to be at home (or on Tailscale, see section 3).
   "reward": 0.5,
   "due_in_minutes": 120,
   "notes": "The tank is the one on the dock",
-  "together": false,
+  "mode": "first",
   "key": "vacuum-clean-water"
 }
 ```
 
 - `kids`: a name (any case), a list like `["Ana", "Ben"]`, `"Ana,Ben"`, or `"all"` (the default).
-  `together: true` makes it one shared chore that only counts once every kid has done it.
+- `mode` sets how several kids share the chore:
+  - `"each"` (default): a separate chore per kid.
+  - `"first"`: the first kid to do it gets it, and it disappears for the others.
+  - `"together"`: one shared chore that only counts once every kid has done it; each kid gets
+    the reward. `together: true` still works as a shortcut for this.
 - `due_in_minutes` sets a deadline from now. `due_at` takes an exact ISO 8601 time instead.
 - **`key` prevents duplicates.** While a chore with the same key is still open (to do, waiting
   for a check, or sent back), the call creates nothing and returns the existing chore with
@@ -275,7 +284,7 @@ rest_command:
        "kids": {{ kids | default('all') | tojson }},
        "reward": {{ reward | default(0) }},
        "due_in_minutes": {{ due_in_minutes | default(120) }},
-       "together": {{ together | default(false) | tojson }},
+       "mode": {{ mode | default('each') | tojson }},
        "key": {{ key | default('') | tojson }}}
 ```
 
@@ -301,7 +310,8 @@ or `..._mop_drying`.
     - action: rest_command.karma_jar_chore
       data:
         title: "Refill the robot vacuum's clean water tank"
-        kids: "Ana"
+        kids: "all"
+        mode: first        # whoever does it first gets the reward
         reward: 0.5
         due_in_minutes: 120
         key: vacuum-clean-water
@@ -316,7 +326,8 @@ or `..._mop_drying`.
     - action: rest_command.karma_jar_chore
       data:
         title: "Empty and rinse the robot vacuum's dirty water tank"
-        kids: "Ben"
+        kids: "all"
+        mode: first
         reward: 0.5
         due_in_minutes: 120
         key: vacuum-dirty-water
@@ -344,7 +355,7 @@ agent's instructions (for Claude Code, a `CLAUDE.md` or a skill):
 > To give the kids a chore in Karma Jar, call the API at `$KARMA_JAR_URL` with header
 > `Authorization: Bearer $KARMA_JAR_TOKEN`. Run `GET /api/ext` first to see the endpoints, and
 > `GET /api/ext/kids` for the kids' names. Create chores with `POST /api/ext/chores`
-> (`title`, `kids`, optional `reward` in dollars, `due_in_minutes`, `notes`, `together`). Use a
+> (`title`, `kids`, optional `reward` in dollars, `due_in_minutes`, `notes`, `mode`: each, first or together). Use a
 > `key` when the same request might be repeated, and use `DELETE /api/ext/chores/<id>` to undo a
 > mistake. Keep titles short and kid-friendly. Parents approve the chores and handle money; the API
 > can't.
