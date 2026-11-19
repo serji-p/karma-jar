@@ -25,14 +25,18 @@ class Flow(unittest.TestCase):
         cls.parent = karma.app.test_client()
         r = cls.parent.post("/api/setup", json={
             "parent": {"name": "Mom", "pin": "1234"},
-            "kids": [{"name": "Ana", "pin": "1111"}, {"name": "Ben", "pin": "2222"}],
+            "kids": [{"name": "Ana"}, {"name": "Ben"}],
         })
         assert r.status_code == 200, r.json
         prof = cls.parent.get("/api/profiles").json
         cls.ana = next(p["id"] for p in prof if p["name"] == "Ana")
         cls.ben = next(p["id"] for p in prof if p["name"] == "Ben")
+        assert cls.parent.post("/api/users", json={"role": "parent", "name": "Dad", "pin": "5678"}).status_code == 200
+        cls.dad = next(p["id"] for p in cls.parent.get("/api/profiles").json if p["name"] == "Dad")
         cls.kid = karma.app.test_client()
-        assert cls.kid.post("/api/login", json={"user_id": cls.ana, "pin": "1111"}).status_code == 200
+        assert cls.kid.post("/api/login", json={"user_id": cls.ana}).status_code == 200  # kids need no PIN
+        cls.kid2 = karma.app.test_client()
+        assert cls.kid2.post("/api/login", json={"user_id": cls.ben}).status_code == 200
 
     def sql(self, q, a=()):
         c = sqlite3.connect(karma.DB_PATH)
@@ -164,11 +168,11 @@ class Flow(unittest.TestCase):
     def test_13_pin_lockout(self):
         c = karma.app.test_client()
         for _ in range(5):
-            self.assertEqual(c.post("/api/login", json={"user_id": self.ben, "pin": "0000"}).status_code, 401)
-        r = c.post("/api/login", json={"user_id": self.ben, "pin": "2222"})
+            self.assertEqual(c.post("/api/login", json={"user_id": self.dad, "pin": "0000"}).status_code, 401)
+        r = c.post("/api/login", json={"user_id": self.dad, "pin": "5678"})
         self.assertEqual(r.status_code, 429, "even the right PIN is refused while locked")
         karma._fails.clear()
-        self.assertEqual(c.post("/api/login", json={"user_id": self.ben, "pin": "2222"}).status_code, 200)
+        self.assertEqual(c.post("/api/login", json={"user_id": self.dad, "pin": "5678"}).status_code, 200)
 
     def test_13b_pin_lockout_parallel(self):
         """Parallel guesses must not get more than 5 real PIN checks before the lock kicks in."""
@@ -176,7 +180,7 @@ class Flow(unittest.TestCase):
         karma._fails.clear()
 
         def guess(pin):
-            return karma.app.test_client().post("/api/login", json={"user_id": self.ben, "pin": pin}).status_code
+            return karma.app.test_client().post("/api/login", json={"user_id": self.dad, "pin": pin}).status_code
 
         with ThreadPoolExecutor(20) as ex:
             codes = list(ex.map(guess, [f"{i:04d}" for i in range(3000, 3040)]))
@@ -184,7 +188,76 @@ class Flow(unittest.TestCase):
         self.assertEqual(codes.count(401) + codes.count(429), 40)
         karma._fails.clear()
 
-    def test_14_last_parent_protected(self):
+    def test_15_kids_have_no_pin_parents_do(self):
+        c = karma.app.test_client()
+        self.assertEqual(c.post("/api/login", json={"user_id": self.dad}).status_code, 401)
+        self.assertEqual(c.post("/api/login", json={"user_id": self.ben, "pin": "whatever"}).status_code, 200)
+        self.assertEqual(self.parent.post("/api/users", json={"role": "kid", "name": "Cy"}).status_code, 200)
+        self.assertEqual(self.parent.post("/api/users", json={"role": "parent", "name": "Gran"}).status_code, 400)
+
+    def test_16_together_chore(self):
+        r = self.parent.post("/api/chores", json={"title": "Tidy playroom", "kid_ids": [self.ana, self.ben], "value": 2, "together": True})
+        self.assertEqual(r.status_code, 200)
+        rows = self.sql("SELECT * FROM chores WHERE title='Tidy playroom' ORDER BY id")
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0]["group_id"] and rows[0]["group_id"] == rows[1]["group_id"])
+        a_bal, b_bal = self.bal(self.ana), self.bal(self.ben)
+        ana_row = next(r for r in rows if r["kid_id"] == self.ana)
+        self.kid.post(f"/api/chores/{ana_row['id']}/submit")
+        mine = next(x for x in self.kid.get("/api/data").json["chores"] if x["id"] == ana_row["id"])
+        self.assertEqual([(m["name"], m["status"]) for m in mine["mates"]], [("Ben", "todo")])
+        ben_row = next(r for r in rows if r["kid_id"] == self.ben)
+        self.kid2.post(f"/api/chores/{ben_row['id']}/submit")
+        self.parent.post(f"/api/chores/{ana_row['id']}/approve", json={})
+        self.assertEqual({r["status"] for r in self.sql("SELECT status FROM chores WHERE title='Tidy playroom'")}, {"approved"})
+        self.assertEqual((self.bal(self.ana), self.bal(self.ben)), (a_bal + 200, b_bal + 200))
+        # deleting the approved together chore takes the reward back from both
+        self.parent.delete(f"/api/chores/{ben_row['id']}")
+        self.assertEqual((self.bal(self.ana), self.bal(self.ben)), (a_bal, b_bal))
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM chores WHERE title='Tidy playroom'")[0]["n"], 0)
+
+    def test_17_together_chore_send_back_and_repeat(self):
+        self.parent.post("/api/chores", json={"title": "Walk dog", "kid_ids": [self.ana, self.ben], "together": True, "repeat": "daily"})
+        rows = self.sql("SELECT * FROM chores WHERE title='Walk dog' ORDER BY id")
+        self.parent.post(f"/api/chores/{rows[0]['id']}/deny", json={"note": "both of you"})
+        self.assertEqual({r["status"] for r in self.sql("SELECT status FROM chores WHERE title='Walk dog'")}, {"denied"})
+        self.parent.post(f"/api/chores/{rows[1]['id']}/approve", json={})
+        nxt = self.sql("SELECT * FROM chores WHERE title='Walk dog' AND status='todo' ORDER BY id")
+        self.assertEqual(len(nxt), 2, "the next copy is created for both kids")
+        self.assertTrue(nxt[0]["group_id"] and nxt[0]["group_id"] == nxt[1]["group_id"] != rows[0]["group_id"])
+        self.parent.put(f"/api/chores/{nxt[0]['id']}", json={"title": "Walk the dog", "value": 1})
+        self.assertEqual(self.sql("SELECT COUNT(*) n FROM chores WHERE title='Walk the dog'")[0]["n"], 2)
+
+    def test_18_together_consequence(self):
+        a_bal, b_bal = self.bal(self.ana), self.bal(self.ben)
+        self.parent.post("/api/punishments", json={"kid_ids": [self.ana, self.ben], "title": "No TV together", "fine": 1,
+                                                   "duration_minutes": 60, "together": True})
+        ps = self.sql("SELECT * FROM punishments WHERE title='No TV together' ORDER BY id")
+        self.assertEqual((len(ps), ps[0]["group_id"] == ps[1]["group_id"]), (2, True))
+        self.assertEqual((self.bal(self.ana), self.bal(self.ben)), (a_bal - 100, b_bal - 100))
+        mine = next(x for x in self.kid.get("/api/data").json["punishments"] if x["title"] == "No TV together")
+        self.assertEqual([m["name"] for m in mine["mates"]], ["Ben"])
+        self.parent.post(f"/api/punishments/{ps[0]['id']}/extend", json={"minutes": 30})
+        ends = {r["ends_at"] for r in self.sql("SELECT ends_at FROM punishments WHERE title='No TV together'")}
+        self.assertEqual(len(ends), 1, "both timers move together")
+        self.assertGreater(ends.pop(), ps[0]["ends_at"])
+        self.parent.delete(f"/api/punishments/{ps[1]['id']}")
+        self.assertEqual((self.bal(self.ana), self.bal(self.ben)), (a_bal, b_bal))
+        self.assertEqual({r["status"] for r in self.sql("SELECT status FROM punishments WHERE title='No TV together'")}, {"cancelled"})
+
+    def test_19_rev_changes_on_writes_only(self):
+        r0 = self.kid.get("/api/rev").json["rev"]
+        self.kid.get("/api/data")
+        self.assertEqual(self.kid.get("/api/rev").json["rev"], r0)
+        self.parent.post("/api/adjust", json={"kid_id": self.ana, "amount": 1})
+        self.assertGreater(self.kid.get("/api/rev").json["rev"], r0)
+        r1 = self.kid.get("/api/rev").json["rev"]
+        self.parent.post("/api/adjust", json={"kid_id": self.ana, "amount": 0})  # rejected -> no change
+        self.assertEqual(self.kid.get("/api/rev").json["rev"], r1)
+        self.assertEqual(self.kid.get("/api/data").json["rev"], r1)
+
+    def test_99_last_parent_protected(self):
+        self.assertEqual(self.parent.delete(f"/api/users/{self.dad}").status_code, 200)
         me = self.parent.get("/api/state").json["me"]["id"]
         self.assertEqual(self.parent.delete(f"/api/users/{me}").status_code, 400)
 

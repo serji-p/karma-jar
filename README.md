@@ -8,8 +8,21 @@ earn money or get fined.
 - **Frontend:** plain JavaScript in `static/`, no build step
 - **Data:** `data/karma.db` plus `data/secret.key`, created on first start
 
-On first start the app shows a setup wizard: you create one parent and the kids, each with a
-4–8 digit PIN. Devices then stay logged in for a year. "Switch user" goes back to the profile picker.
+On first start the app shows a setup wizard where you create one parent and the kids.
+**Only parents have a PIN (4–8 digits).** Kids just tap their own profile. Devices stay logged in
+for a year, and "Switch user" goes back to the profile picker.
+
+**Together:** pick two or more kids and choose 🤝 Together.
+- A **together chore** only goes to the parent for review once every kid in it has tapped
+  "I did it!". Each kid sees whether the others are done yet. Approving it pays every kid the
+  reward, and sending it back, marking it missed, editing or deleting it applies to all of them.
+  A repeating together chore schedules its next copy for everyone.
+- A **together consequence** is a single item for the parent: extending, shortening, ending or
+  cancelling it acts on all the kids, and cancelling refunds every kid's fine.
+
+**Live updates:** every screen checks for changes every 3 seconds with a tiny request, and only
+reloads when something changed. A chore a parent adds shows up on the kid's tablet within a few
+seconds, with no need to tap anything.
 
 ---
 

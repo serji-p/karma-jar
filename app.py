@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS chores (
     created_at TEXT NOT NULL,
     submitted_at TEXT,
     decided_at TEXT,
-    decided_by INTEGER
+    decided_by INTEGER,
+    group_id INTEGER  -- "together" chores: one row per kid, same group_id
 );
 CREATE TABLE IF NOT EXISTS punishments (
     id INTEGER PRIMARY KEY,
@@ -80,7 +81,8 @@ CREATE TABLE IF NOT EXISTS punishments (
     ends_at TEXT,
     status TEXT NOT NULL DEFAULT 'active',  -- active | ended | cancelled
     created_by INTEGER,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    group_id INTEGER  -- "together" consequences: one row per kid, same group_id
 );
 CREATE TABLE IF NOT EXISTS ledger (
     id INTEGER PRIMARY KEY,
@@ -142,6 +144,10 @@ def close_db(_exc):
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    for table in ("chores", "punishments"):  # migrate databases created before "together" existed
+        if "group_id" not in [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN group_id INTEGER")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_group ON {table}(group_id)")
     conn.commit()
     conn.close()
 
@@ -261,6 +267,29 @@ def claim_attempt(uid):
             f["until"] = time.time() + 30 * (2 ** min(f["count"] - 5, 5))
 
 
+# Change counter for cheap live refresh: every successful write bumps it, clients poll /api/rev
+# every few seconds and only reload data when it changed. In memory is fine with ONE worker; a
+# restart starts from a new value, which simply makes every client reload once.
+_rev = {"n": int(time.time())}
+_rev_lock = threading.Lock()
+
+
+@app.after_request
+def bump_rev(resp):
+    if (request.method in ("POST", "PUT", "DELETE") and request.path.startswith("/api/")
+            and request.path not in ("/api/login", "/api/logout") and resp.status_code < 400):
+        with _rev_lock:
+            _rev["n"] += 1
+    return resp
+
+
+@app.get("/api/rev")
+def rev():
+    resp = jsonify(rev=_rev["n"])
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.errorhandler(HTTPException)
 def json_error(e):
     if request.path.startswith("/api/"):
@@ -317,7 +346,7 @@ def setup():
             continue
         db().execute(
             "INSERT INTO users (name, role, pin_hash, color, created_at) VALUES (?,?,?,?,?)",
-            (name, "kid", generate_password_hash(valid_pin(k.get("pin"))), clean(k.get("color"), 9) or COLORS[i % len(COLORS)], t),
+            (name, "kid", "", clean(k.get("color"), 9) or COLORS[i % len(COLORS)], t),  # kids have no PIN
         )
     db().commit()
     session.permanent = True
@@ -334,12 +363,13 @@ def profiles():
 def login():
     b = body()
     uid = to_int(b.get("user_id"))
-    claim_attempt(uid)
     u = one("SELECT * FROM users WHERE id = ?", (uid,))
-    if not u or not check_password_hash(u["pin_hash"], str(b.get("pin") or "")):
-        abort(401, "Wrong PIN")
-    with _fails_lock:
-        _fails.pop(uid, None)
+    if not (u and u["role"] == "kid"):  # kids just tap their profile; only parents need a PIN
+        claim_attempt(uid)
+        if not u or not check_password_hash(u["pin_hash"], str(b.get("pin") or "")):
+            abort(401, "Wrong PIN")
+        with _fails_lock:
+            _fails.pop(uid, None)
     session.permanent = True
     session["uid"] = u["id"]
     return jsonify(me=public_user(u))
@@ -364,21 +394,23 @@ def data():
             role="kid",
             server_time=iso(now()),
             me=kid,
-            chores=rows(
+            rev=_rev["n"],
+            chores=with_mates("chores", rows(
                 "SELECT * FROM chores WHERE kid_id=? AND (status IN ('todo','submitted','denied') OR decided_at >= ?) ORDER BY "
                 "CASE status WHEN 'denied' THEN 0 WHEN 'todo' THEN 1 WHEN 'submitted' THEN 2 ELSE 3 END, due_at IS NULL, due_at, id",
                 (u["id"], cutoff),
-            ),
-            punishments=rows(
+            )),
+            punishments=with_mates("punishments", rows(
                 "SELECT * FROM punishments WHERE kid_id=? AND (status='active' OR created_at >= ?) ORDER BY status='active' DESC, created_at DESC",
                 (u["id"], cutoff),
-            ),
+            )),
             ledger=rows("SELECT * FROM ledger WHERE kid_id=? ORDER BY id DESC LIMIT 40", (u["id"],)),
         )
     kids = [kid_summary(k) for k in rows("SELECT * FROM users WHERE role='kid' ORDER BY id")]
     return jsonify(
         role="parent",
         server_time=iso(now()),
+        rev=_rev["n"],
         me=public_user(u),
         kids=kids,
         parents=rows("SELECT id, name, color FROM users WHERE role='parent' ORDER BY id"),
@@ -393,6 +425,33 @@ def data():
         ),
         ledger=rows("SELECT * FROM ledger ORDER BY id DESC LIMIT 100"),
     )
+
+
+# ---------------------------------------------------------------- groups ("together")
+def group_of(table, item):
+    """All rows that belong together with item (just [item] for a solo chore/consequence)."""
+    if item.get("group_id"):
+        return rows(f"SELECT * FROM {table} WHERE group_id=? ORDER BY id", (item["group_id"],))
+    return [item]
+
+
+def link_group(table, ids):
+    """Give rows a shared group_id (the first row's id)."""
+    if len(ids) > 1:
+        db().execute(f"UPDATE {table} SET group_id=? WHERE id IN ({','.join('?' * len(ids))})", (ids[0], *ids))
+
+
+def with_mates(table, items):
+    """For a kid's view: add 'mates' (the other kids in each together item) with their status."""
+    gids = sorted({i["group_id"] for i in items if i.get("group_id")})
+    if not gids:
+        return items
+    mates = rows(
+        f"SELECT t.group_id, t.kid_id, t.status, u.name, u.color FROM {table} t JOIN users u ON u.id = t.kid_id "
+        f"WHERE t.group_id IN ({','.join('?' * len(gids))}) ORDER BY t.id", gids)
+    for i in items:
+        i["mates"] = [m for m in mates if i.get("group_id") and m["group_id"] == i["group_id"] and m["kid_id"] != i["kid_id"]]
+    return items
 
 
 # ---------------------------------------------------------------- chores
@@ -417,12 +476,15 @@ def create_chore():
     due = parse_dt(b.get("due_at"))
     value = cents(b.get("value"))
     t = iso(now())
+    ids = []
     for kid_id in kid_ids:
         get_kid(kid_id)
-        db().execute(
+        ids.append(db().execute(
             "INSERT INTO chores (kid_id, title, notes, value_cents, due_at, repeat, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
             (kid_id, title, clean(b.get("notes"), 500), value, iso(due), repeat, g.user["id"], t),
-        )
+        ).lastrowid)
+    if b.get("together"):  # done together: only counts once every kid has marked it done
+        link_group("chores", ids)
     db().commit()
     return jsonify(ok=True)
 
@@ -435,8 +497,8 @@ def edit_chore(cid):
     title = clean(b.get("title"), 80) or c["title"]
     repeat = b.get("repeat") if b.get("repeat") in REPEATS else c["repeat"]
     db().execute(
-        "UPDATE chores SET title=?, notes=?, value_cents=?, due_at=?, repeat=? WHERE id=?",
-        (title, clean(b.get("notes"), 500), cents(b.get("value")), iso(parse_dt(b.get("due_at"))), repeat, cid),
+        "UPDATE chores SET title=?, notes=?, value_cents=?, due_at=?, repeat=? WHERE id=? OR (group_id IS NOT NULL AND group_id=?)",
+        (title, clean(b.get("notes"), 500), cents(b.get("value")), iso(parse_dt(b.get("due_at"))), repeat, cid, c["group_id"]),
     )
     db().commit()
     return jsonify(ok=True)
@@ -445,11 +507,11 @@ def edit_chore(cid):
 @app.delete("/api/chores/<int:cid>")
 @require("parent")
 def delete_chore(cid):
-    c = chore_or_404(cid)
-    if c["status"] == "approved":
-        # undo the money too
-        db().execute("DELETE FROM ledger WHERE kind='chore' AND ref_id=?", (cid,))
-    db().execute("DELETE FROM chores WHERE id=?", (cid,))
+    for r in group_of("chores", chore_or_404(cid)):
+        if r["status"] == "approved":
+            # undo the money too
+            db().execute("DELETE FROM ledger WHERE kind='chore' AND ref_id=?", (r["id"],))
+        db().execute("DELETE FROM chores WHERE id=?", (r["id"],))
     db().commit()
     return jsonify(ok=True)
 
@@ -481,7 +543,9 @@ def unsubmit_chore(cid):
     return jsonify(ok=True)
 
 
-def spawn_next(c):
+def spawn_next(grp):
+    """Schedule the next copy of a repeating chore (for every kid of a together chore)."""
+    c = grp[0]
     step = REPEATS.get(c["repeat"])
     if not step:
         return
@@ -489,28 +553,34 @@ def spawn_next(c):
     nxt = base + step
     while nxt < now():
         nxt += step
-    db().execute(
+    ids = [db().execute(
         "INSERT INTO chores (kid_id, title, notes, value_cents, due_at, repeat, created_by, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (c["kid_id"], c["title"], c["notes"], c["value_cents"], iso(nxt), c["repeat"], c["created_by"], iso(now())),
-    )
+        (r["kid_id"], r["title"], r["notes"], r["value_cents"], iso(nxt), r["repeat"], r["created_by"], iso(now())),
+    ).lastrowid for r in grp]
+    if c["group_id"]:
+        link_group("chores", ids)
 
 
 @app.post("/api/chores/<int:cid>/approve")
 @require("parent")
 def approve_chore(cid):
     c = chore_or_404(cid)
-    if c["status"] == "approved":
+    grp = group_of("chores", c)
+    if all(r["status"] == "approved" for r in grp):
         abort(400, "Already approved")
     b = body()
     value = cents(b["value"]) if "value" in b else c["value_cents"]
-    db().execute(
-        "UPDATE chores SET status='approved', decided_at=?, decided_by=?, parent_note=?, value_cents=? WHERE id=?",
-        (iso(now()), g.user["id"], clean(b.get("note"), 300), value, cid),
-    )
-    if value:
-        ledger_add(c["kid_id"], value, "chore", c["title"], cid)
+    for r in grp:  # a together chore pays every kid in it
+        if r["status"] == "approved":
+            continue
+        db().execute(
+            "UPDATE chores SET status='approved', decided_at=?, decided_by=?, parent_note=?, value_cents=? WHERE id=?",
+            (iso(now()), g.user["id"], clean(b.get("note"), 300), value, r["id"]),
+        )
+        if value:
+            ledger_add(r["kid_id"], value, "chore", r["title"], r["id"])
     if c["status"] != "missed":  # "missed" already scheduled the next copy
-        spawn_next(c)
+        spawn_next(grp)
     db().commit()
     return jsonify(ok=True)
 
@@ -522,8 +592,9 @@ def deny_chore(cid):
     if c["status"] not in ("todo", "submitted", "denied"):
         abort(400, "This chore is already finished")
     db().execute(
-        "UPDATE chores SET status='denied', decided_at=?, decided_by=?, parent_note=? WHERE id=?",
-        (iso(now()), g.user["id"], clean(body().get("note"), 300), cid),
+        "UPDATE chores SET status='denied', decided_at=?, decided_by=?, parent_note=? "
+        "WHERE (id=? OR (group_id IS NOT NULL AND group_id=?)) AND status IN ('todo','submitted','denied')",
+        (iso(now()), g.user["id"], clean(body().get("note"), 300), cid, c["group_id"]),
     )
     db().commit()
     return jsonify(ok=True)
@@ -535,11 +606,13 @@ def missed_chore(cid):
     c = chore_or_404(cid)
     if c["status"] not in ("todo", "submitted", "denied"):
         abort(400, "This chore is already finished")
+    grp = group_of("chores", c)
     db().execute(
-        "UPDATE chores SET status='missed', decided_at=?, decided_by=?, parent_note=? WHERE id=?",
-        (iso(now()), g.user["id"], clean(body().get("note"), 300), cid),
+        "UPDATE chores SET status='missed', decided_at=?, decided_by=?, parent_note=? "
+        "WHERE (id=? OR (group_id IS NOT NULL AND group_id=?)) AND status IN ('todo','submitted','denied')",
+        (iso(now()), g.user["id"], clean(body().get("note"), 300), cid, c["group_id"]),
     )
-    spawn_next(c)
+    spawn_next(grp)
     db().commit()
     return jsonify(ok=True)
 
@@ -572,6 +645,7 @@ def create_punishment():
     start = parse_dt(b.get("starts_at")) or now()
     end = start + timedelta(minutes=minutes) if minutes else None
     status = "active" if minutes else "ended"
+    ids = []
     for kid_id in kid_ids:
         get_kid(kid_id)
         cur = db().execute(
@@ -579,8 +653,11 @@ def create_punishment():
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (kid_id, title, clean(b.get("reason"), 300), fine, minutes, iso(start), iso(end), status, g.user["id"], iso(now())),
         )
+        ids.append(cur.lastrowid)
         if fine:
             ledger_add(kid_id, -fine, "fine", title, cur.lastrowid)
+    if b.get("together"):  # one shared consequence: ending, extending or cancelling it acts on all kids
+        link_group("punishments", ids)
     db().commit()
     return jsonify(ok=True)
 
@@ -588,9 +665,11 @@ def create_punishment():
 @app.post("/api/punishments/<int:pid>/end")
 @require("parent")
 def end_punishment(pid):
-    if pun_or_404(pid)["status"] != "active":
+    grp = [p for p in group_of("punishments", pun_or_404(pid)) if p["status"] == "active"]
+    if not grp:
         abort(400, "It's not active")
-    db().execute("UPDATE punishments SET status='ended', ends_at=? WHERE id=?", (iso(now()), pid))
+    for p in grp:
+        db().execute("UPDATE punishments SET status='ended', ends_at=? WHERE id=?", (iso(now()), p["id"]))
     db().commit()
     return jsonify(ok=True)
 
@@ -598,19 +677,19 @@ def end_punishment(pid):
 @app.post("/api/punishments/<int:pid>/extend")
 @require("parent")
 def extend_punishment(pid):
-    p = pun_or_404(pid)
-    if p["status"] != "active" or not p["ends_at"]:
+    grp = [p for p in group_of("punishments", pun_or_404(pid)) if p["status"] == "active" and p["ends_at"]]
+    if not grp:
         abort(400, "It's not active")
     minutes = to_int(body().get("minutes"), "minutes")
-    base = parse_dt(p["ends_at"])
-    new_end = base + timedelta(minutes=minutes)
-    if new_end <= now():
-        db().execute("UPDATE punishments SET status='ended', ends_at=? WHERE id=?", (iso(now()), pid))
-    else:
-        db().execute(
-            "UPDATE punishments SET status='active', ends_at=?, duration_minutes=duration_minutes+? WHERE id=?",
-            (iso(new_end), minutes, pid),
-        )
+    for p in grp:
+        new_end = parse_dt(p["ends_at"]) + timedelta(minutes=minutes)
+        if new_end <= now():
+            db().execute("UPDATE punishments SET status='ended', ends_at=? WHERE id=?", (iso(now()), p["id"]))
+        else:
+            db().execute(
+                "UPDATE punishments SET status='active', ends_at=?, duration_minutes=duration_minutes+? WHERE id=?",
+                (iso(new_end), minutes, p["id"]),
+            )
     db().commit()
     return jsonify(ok=True)
 
@@ -619,12 +698,13 @@ def extend_punishment(pid):
 @require("parent")
 def cancel_punishment(pid):
     """Cancel = it never happened: removes it and refunds the fine."""
-    p = pun_or_404(pid)
-    if p["status"] == "cancelled":
+    grp = [p for p in group_of("punishments", pun_or_404(pid)) if p["status"] != "cancelled"]
+    if not grp:
         abort(400, "Already cancelled")
-    if p["fine_cents"]:
-        ledger_add(p["kid_id"], p["fine_cents"], "refund", f"Cancelled: {p['title']}", pid)
-    db().execute("UPDATE punishments SET status='cancelled', ends_at=COALESCE(ends_at, ?) WHERE id=?", (iso(now()), pid))
+    for p in grp:
+        if p["fine_cents"]:
+            ledger_add(p["kid_id"], p["fine_cents"], "refund", f"Cancelled: {p['title']}", p["id"])
+        db().execute("UPDATE punishments SET status='cancelled', ends_at=COALESCE(ends_at, ?) WHERE id=?", (iso(now()), p["id"]))
     db().commit()
     return jsonify(ok=True)
 
@@ -679,9 +759,10 @@ def add_user():
     if not name:
         abort(400, "Name required")
     n = one("SELECT COUNT(*) AS n FROM users")["n"]
+    pin_hash = generate_password_hash(valid_pin(b.get("pin"))) if role == "parent" else ""
     db().execute(
         "INSERT INTO users (name, role, pin_hash, color, jar_size_cents, goal_label, created_at) VALUES (?,?,?,?,?,?,?)",
-        (name, role, generate_password_hash(valid_pin(b.get("pin"))), clean(b.get("color"), 9) or COLORS[n % len(COLORS)],
+        (name, role, pin_hash, clean(b.get("color"), 9) or COLORS[n % len(COLORS)],
          cents(b.get("jar_size") or 20) or 2000, clean(b.get("goal_label"), 60), iso(now())),
     )
     db().commit()
@@ -701,7 +782,7 @@ def edit_user(uid):
     goal = clean(b.get("goal_label"), 60) if "goal_label" in b else u["goal_label"]
     db().execute("UPDATE users SET name=?, color=?, jar_size_cents=?, goal_label=? WHERE id=?",
                  (name, color, max(jar, 100), goal, uid))
-    if b.get("pin"):
+    if b.get("pin") and u["role"] == "parent":
         db().execute("UPDATE users SET pin_hash=? WHERE id=?", (generate_password_hash(valid_pin(b["pin"])), uid))
     db().commit()
     return jsonify(ok=True)

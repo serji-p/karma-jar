@@ -254,9 +254,20 @@
     }
   }
 
+  // Live refresh: every 3 s ask the server whether anything changed (a tiny request) and reload only
+  // when it did, so a chore a parent adds shows up on the kid's tablet within seconds. A full reload
+  // also happens about once a minute so "today / tomorrow" labels stay right. Never while a sheet is open.
   function startPolling() {
     clearInterval(S.pollTimer);
-    S.pollTimer = setInterval(() => { if (document.visibilityState === "visible" && S.me && !$(".sheet-backdrop")) refresh().catch(() => {}); }, 15000);
+    let ticks = 0, busy = false;
+    S.pollTimer = setInterval(async () => {
+      if (busy || document.visibilityState !== "visible" || !S.me || $(".sheet-backdrop")) return;
+      busy = true;
+      try {
+        const { rev } = await api("GET", "/api/rev");
+        if (rev !== S.data?.rev || ++ticks % 20 === 0) await refresh();
+      } catch (_) { /* offline: try again next tick */ } finally { busy = false; }
+    }, 3000);
   }
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && S.me) refresh().catch(() => {}); });
 
@@ -287,7 +298,6 @@
   function renderSetup() {
     const kidRow = (i) => `<div class="kid-setup" data-kid>
       <label class="field"><span>Kid's name</span><input class="input" data-k="name" placeholder="Name" maxlength="40"></label>
-      <label class="field"><span>Kid's PIN (4–8 digits)</span><input class="input" data-k="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="e.g. 1111"></label>
       <div class="swatches" data-k="color">${COLORS.slice(0, 6).map((c, j) => `<button type="button" class="swatch ${j === i % 6 ? "on" : ""}" style="background:${c}" data-v="${c}"></button>`).join("")}</div>
     </div>`;
     app.innerHTML = `<div class="center-wrap">
@@ -310,7 +320,6 @@
     $("#go").onclick = (e) => guard(e.currentTarget, async () => {
       const kids = $$("[data-kid]").map((k) => ({
         name: $('[data-k="name"]', k).value.trim(),
-        pin: $('[data-k="pin"]', k).value.trim(),
         color: ($(".swatch.on", k) || {}).dataset?.v,
       })).filter((k) => k.name);
       if (!kids.length) throw new Error("Add at least one kid");
@@ -336,7 +345,11 @@
       <div class="profiles">${parents.map(tile).join("")}</div>
     </div>`;
     settleJars();
-    $$(".profile-tile").forEach((t) => (t.onclick = () => pinPad(profiles.find((p) => p.id == t.dataset.id))));
+    $$(".profile-tile").forEach((t) => (t.onclick = () => {
+      const p = profiles.find((x) => x.id == t.dataset.id);
+      if (p.role !== "kid") return pinPad(p);
+      guard(t, async () => { await api("POST", "/api/login", { user_id: p.id }); S.me = p; await refresh(); });
+    }));
   }
 
   function pinPad(p) {
@@ -413,17 +426,23 @@
     const activeP = d.punishments.filter((p) => p.status === "active");
     const pastP = d.punishments.filter((p) => p.status !== "active").slice(0, 5);
 
+    const mateNames = (c) => (c.mates || []).map((m) => esc(m.name)).join(" & ");
     const choreCard = (c) => {
       const due = dueInfo(c);
+      const mates = c.mates || [];
+      const notYet = mates.filter((m) => !["submitted", "approved"].includes(m.status));
+      const withPill = mates.length ? `<span class="pill brand">🤝 with ${mates.map((m) => esc(m.name) + (["submitted", "approved"].includes(m.status) ? " ✓" : "")).join(" & ")}</span>` : "";
       if (c.status === "submitted") return `<div class="card kid-chore waiting" style="--c:${me.color}">
-          <div class="grow"><div class="title">${esc(c.title)}</div><div class="sub"><span class="pill warn">⏳ Waiting for a parent to check</span></div></div>
+          <div class="grow"><div class="title">${esc(c.title)}</div><div class="sub">${notYet.length
+            ? `<span class="pill warn">⏳ Waiting for ${notYet.map((m) => esc(m.name)).join(" & ")} to finish too</span>`
+            : `<span class="pill warn">⏳ Waiting for a parent to check</span>`}${withPill}</div></div>
           <div class="right">${c.value_cents ? `<div class="value">${money0(c.value_cents)}</div>` : ""}<button class="btn plain sm" data-undo="${c.id}">Oops, undo</button></div></div>`;
       if (c.status === "approved") return `<div class="card kid-chore done"><div class="grow"><div class="title">✅ ${esc(c.title)}</div>
           <div class="sub"><span class="pill good">Approved ${c.value_cents ? "· +" + money0(c.value_cents) : ""}</span>${c.parent_note ? `<span>“${esc(c.parent_note)}”</span>` : ""}</div></div></div>`;
       if (c.status === "missed") return `<div class="card kid-chore done" style="border-left-color:#ccc"><div class="grow"><div class="title">${esc(c.title)}</div><div class="sub"><span class="pill">Missed</span></div></div></div>`;
       return `<div class="card kid-chore ${c.status === "denied" ? "denied" : ""}" style="--c:${me.color}">
           <div class="grow"><div class="title">${esc(c.title)}</div>
-          <div class="sub">${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}</div>
+          <div class="sub">${withPill}${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}</div>
           ${c.notes ? `<div class="muted" style="margin-top:6px">${esc(c.notes)}</div>` : ""}
           ${c.status === "denied" ? `<div class="pill bad" style="margin-top:8px;white-space:normal">↩️ Try again${c.parent_note ? ": " + esc(c.parent_note) : ""}</div>` : ""}</div>
           <div class="right">${c.value_cents ? `<div class="value">${money0(c.value_cents)}</div>` : ""}<button class="btn good" data-done="${c.id}">I did it! ✋</button></div></div>`;
@@ -435,7 +454,7 @@
         <div class="emoji">${PUN_EMOJI(p.title)}</div>
         <div class="grow"><div class="title">${esc(p.title)}</div>
           ${p.reason ? `<div class="muted">${esc(p.reason)}</div>` : ""}
-          <div class="row" style="margin-top:6px;gap:6px;flex-wrap:wrap">${p.status === "cancelled" ? `<span class="pill good">Cancelled${p.fine_cents ? " · " + money0(p.fine_cents) + " back in jar" : ""}</span>` : p.fine_cents ? `<span class="pill bad">−${money0(p.fine_cents)} from jar</span>` : ""}</div></div>
+          <div class="row" style="margin-top:6px;gap:6px;flex-wrap:wrap">${p.mates?.length ? `<span class="pill brand">🤝 with ${mateNames(p)}</span>` : ""}${p.status === "cancelled" ? `<span class="pill good">Cancelled${p.fine_cents ? " · " + money0(p.fine_cents) + " back in jar" : ""}</span>` : p.fine_cents ? `<span class="pill bad">−${money0(p.fine_cents)} from jar</span>` : ""}</div></div>
         ${p.duration_minutes && p.status !== "cancelled" ? (isActive ? `<div class="timer" data-ends="${p.ends_at}">${fmtDur(new Date(p.ends_at) - nowMs())} left</div>` : `<div class="timer">Over ✓</div>`) : ""}
       </div>`;
     };
@@ -489,13 +508,36 @@
   // ------------------------------------------------------------ PARENT VIEW
   const kidById = (id) => S.data.kids.find((k) => k.id === id) || { name: "?", color: "#ccc" };
 
+  // "Together" chores/consequences are stored as one row per kid with a shared group_id.
+  // The parent sees each group as ONE item ({...firstRow, rows: [...]}); actions on it act on all rows.
+  function grouped(list) {
+    const out = [], byGid = {};
+    for (const x of list) {
+      if (x.group_id && byGid[x.group_id]) { byGid[x.group_id].rows.push(x); continue; }
+      const it = { ...x, rows: [x] };
+      if (x.group_id) byGid[x.group_id] = it;
+      out.push(it);
+    }
+    for (const it of out) if (it.rows.length > 1) it.status = groupStatus(it.rows.map((r) => r.status));
+    return out;
+  }
+  function groupStatus(st) {
+    if (st.every((x) => x === st[0])) return st[0];
+    if (st.includes("active")) return "active";
+    if (st.includes("denied")) return "denied";
+    return "todo"; // some kids marked it done, others not yet
+  }
+  const stripeStyle = (it) => it.rows.length > 1 ? `style="background:linear-gradient(${it.rows.map((r) => kidById(r.kid_id).color).join(",")})"` : "";
+  const each = (it) => (it.rows.length > 1 ? " each" : "");
+
   function renderParent() {
     const d = S.data;
-    const pending = d.chores.filter((c) => c.status === "submitted");
+    S.items = { chores: grouped(d.chores), puns: grouped(d.punishments) };
+    const pending = S.items.chores.filter((c) => c.status === "submitted");
     const tabs = [
       ["home", "🏠", "Home", pending.length],
       ["chores", "🧹", "Chores", 0],
-      ["cons", "⏳", "Consequences", d.punishments.filter((p) => p.status === "active").length],
+      ["cons", "⏳", "Consequences", S.items.puns.filter((p) => p.status === "active").length],
       ["money", "🫙", "Jars", 0],
       ["settings", "⚙️", "Settings", 0],
     ];
@@ -526,30 +568,34 @@
 
   // --- reusable item renderers
   function choreItem(c, { actions = true } = {}) {
-    const k = kidById(c.kid_id);
     const due = dueInfo(c);
+    const open = ["todo", "denied"].includes(c.status);
+    const who = c.rows.length > 1
+      ? `<span class="pill brand">🤝 ${c.rows.map((r) => (open ? (r.status === "submitted" ? "✓ " : "⏳ ") : "") + esc(kidById(r.kid_id).name)).join(open ? " · " : " + ")}</span>`
+      : `<b style="color:var(--ink)">${esc(kidById(c.kid_id).name)}</b>`;
+    const kidNotes = c.rows.filter((r) => r.kid_note).map((r) => `<div class="note">💬 ${c.rows.length > 1 ? esc(kidById(r.kid_id).name) + ": " : ""}“${esc(r.kid_note)}”</div>`).join("");
     const st = {
       todo: `<span class="pill">To do</span>`, denied: `<span class="pill bad">Sent back</span>`, submitted: `<span class="pill warn">Needs review</span>`,
       approved: `<span class="pill good">Approved</span>`, missed: `<span class="pill">Missed</span>`,
     }[c.status];
     let act = "";
-    if (actions && c.status === "submitted") act = `<div class="actions"><button class="btn good sm" data-approve="${c.id}">✓ Approve${c.value_cents ? " +" + money0(c.value_cents) : ""}</button><button class="btn soft-bad sm" data-deny="${c.id}">✕ Send back</button></div>`;
-    return `<div class="card item tap" data-chore="${c.id}" style="--c:${k.color}"><div class="stripe"></div><div class="grow">
-      <div class="row"><div class="title grow">${esc(c.title)}</div>${c.value_cents ? `<span class="pill money">${money0(c.value_cents)}</span>` : ""}</div>
-      <div class="sub"><b style="color:var(--ink)">${esc(k.name)}</b>${st}${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}
+    if (actions && c.status === "submitted") act = `<div class="actions"><button class="btn good sm" data-approve="${c.id}">✓ Approve${c.value_cents ? " +" + money0(c.value_cents) + each(c) : ""}</button><button class="btn soft-bad sm" data-deny="${c.id}">✕ Send back</button></div>`;
+    return `<div class="card item tap" data-chore="${c.id}" style="--c:${kidById(c.kid_id).color}"><div class="stripe" ${stripeStyle(c)}></div><div class="grow">
+      <div class="row"><div class="title grow">${esc(c.title)}</div>${c.value_cents ? `<span class="pill money">${money0(c.value_cents)}${each(c)}</span>` : ""}</div>
+      <div class="sub">${who}${st}${due ? `<span class="pill ${due.cls}">${due.text}</span>` : ""}${c.repeat !== "none" ? `<span class="pill brand">🔁 ${c.repeat}</span>` : ""}
         ${c.status === "submitted" && c.submitted_at ? `<span>done ${fmtDate(c.submitted_at)}</span>` : ""}</div>
-      ${c.kid_note ? `<div class="note">💬 “${esc(c.kid_note)}”</div>` : ""}
+      ${kidNotes}
       ${c.parent_note && c.status !== "submitted" ? `<div class="note">📝 ${esc(c.parent_note)}</div>` : ""}
       ${act}</div></div>`;
   }
 
   function punItem(p) {
-    const k = kidById(p.kid_id);
     const active = p.status === "active";
-    return `<div class="card item tap" data-pun="${p.id}" style="--c:${k.color}"><div class="stripe"></div><div class="grow">
+    const who = p.rows.length > 1 ? `<span class="pill brand">🤝 ${p.rows.map((r) => esc(kidById(r.kid_id).name)).join(" + ")}</span>` : `<b style="color:var(--ink)">${esc(kidById(p.kid_id).name)}</b>`;
+    return `<div class="card item tap" data-pun="${p.id}" style="--c:${kidById(p.kid_id).color}"><div class="stripe" ${stripeStyle(p)}></div><div class="grow">
       <div class="row"><div class="title grow">${PUN_EMOJI(p.title)} ${esc(p.title)}</div>${active ? `<span class="pill bad timer" data-ends="${p.ends_at}">${fmtDur(new Date(p.ends_at) - nowMs())} left</span>` : ""}</div>
-      <div class="sub"><b style="color:var(--ink)">${esc(k.name)}</b>
-        ${p.fine_cents ? (p.status === "cancelled" ? `<span class="pill good">${money0(p.fine_cents)} refunded</span>` : `<span class="pill bad">−${money0(p.fine_cents)}</span>`) : ""}
+      <div class="sub">${who}
+        ${p.fine_cents ? (p.status === "cancelled" ? `<span class="pill good">${money0(p.fine_cents)}${each(p)} refunded</span>` : `<span class="pill bad">−${money0(p.fine_cents)}${each(p)}</span>`) : ""}
         ${p.duration_minutes ? `<span class="pill">⏱ ${fmtMinutes(p.duration_minutes)}</span>` : ""}
         ${p.status === "cancelled" ? `<span class="pill good">Cancelled</span>` : !active ? `<span class="pill">${p.duration_minutes ? "Ended" : "Applied"}</span>` : ""}
         <span>${fmtDate(p.created_at)}</span></div>
@@ -558,7 +604,7 @@
 
   function kidCard(k) {
     const active = S.data.punishments.filter((p) => p.kid_id === k.id && p.status === "active").length;
-    const pend = S.data.chores.filter((c) => c.kid_id === k.id && c.status === "submitted").length;
+    const pend = S.items.chores.filter((c) => c.status === "submitted" && c.rows.some((r) => r.kid_id === k.id)).length;
     const todo = S.data.chores.filter((c) => c.kid_id === k.id && ["todo", "denied"].includes(c.status)).length;
     return `<div class="card kid-card tap" data-kidcard="${k.id}" style="--c:${k.color}">
       ${jarSVG(k.balance_cents / Math.max(k.jar_size_cents, 1), k.color, 80, 0, "card" + k.id)}
@@ -570,9 +616,9 @@
   // --- tabs
   function pHome() {
     const d = S.data;
-    const pending = d.chores.filter((c) => c.status === "submitted");
-    const late = d.chores.filter((c) => ["todo", "denied"].includes(c.status) && c.due_at && new Date(c.due_at) < nowMs());
-    const active = d.punishments.filter((p) => p.status === "active");
+    const pending = S.items.chores.filter((c) => c.status === "submitted");
+    const late = S.items.chores.filter((c) => ["todo", "denied"].includes(c.status) && c.due_at && new Date(c.due_at) < nowMs());
+    const active = S.items.puns.filter((p) => p.status === "active");
     return `<div class="kid-cards">${d.kids.map(kidCard).join("") || `<div class="card empty">No kids yet. Add them in Settings.</div>`}</div>
       <div class="section-title">Needs your review ${pending.length ? `<span class="badge">${pending.length}</span>` : ""}</div>
       <div class="list">${pending.length ? pending.map((c) => choreItem(c)).join("") : `<div class="card empty"><span class="big">☕</span>Nothing to review.</div>`}</div>
@@ -584,10 +630,10 @@
     return `<div class="filter-bar" id="kf"><button class="chip ${S.kidFilter === "all" ? "on" : ""}" data-kf="all">Everyone</button>
       ${S.data.kids.map((k) => `<button class="chip kidchip ${S.kidFilter == k.id ? "on" : ""}" style="--c:${k.color}" data-kf="${k.id}"><span class="dot"></span>${esc(k.name)}</button>`).join("")}</div>`;
   }
-  const byKid = (x) => S.kidFilter === "all" || x.kid_id == S.kidFilter;
+  const byKid = (x) => S.kidFilter === "all" || x.rows.some((r) => r.kid_id == S.kidFilter);
 
   function pChores() {
-    const cs = S.data.chores.filter(byKid);
+    const cs = S.items.chores.filter(byKid);
     const groups = [
       ["Needs review", cs.filter((c) => c.status === "submitted")],
       ["To do", cs.filter((c) => ["todo", "denied"].includes(c.status))],
@@ -598,7 +644,7 @@
   }
 
   function pCons() {
-    const ps = S.data.punishments.filter(byKid);
+    const ps = S.items.puns.filter(byKid);
     const act = ps.filter((p) => p.status === "active"), past = ps.filter((p) => p.status !== "active");
     return kidFilterBar() + `<div class="section-title">Active now</div><div class="list">${act.length ? act.map(punItem).join("") : `<div class="card empty"><span class="big">😇</span>No active consequences.</div>`}</div>
       ${past.length ? `<div class="section-title">History (last 30 days)</div><div class="list">${past.map(punItem).join("")}</div>` : ""}`;
@@ -638,10 +684,11 @@
   function wireParent() {
     const d = S.data;
     $$("[data-kf]").forEach((b) => (b.onclick = () => { S.kidFilter = b.dataset.kf; render(); }));
-    $$("[data-approve]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); approve(d.chores.find((c) => c.id == b.dataset.approve), b); }));
-    $$("[data-deny]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); denyForm(d.chores.find((c) => c.id == b.dataset.deny)); }));
-    $$("[data-chore]").forEach((el) => (el.onclick = () => choreActions(d.chores.find((c) => c.id == el.dataset.chore))));
-    $$("[data-pun]").forEach((el) => (el.onclick = () => punActions(d.punishments.find((p) => p.id == el.dataset.pun))));
+    const chore = (id) => S.items.chores.find((c) => c.id == id), pun = (id) => S.items.puns.find((p) => p.id == id);
+    $$("[data-approve]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); approve(chore(b.dataset.approve), b); }));
+    $$("[data-deny]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); denyForm(chore(b.dataset.deny)); }));
+    $$("[data-chore]").forEach((el) => (el.onclick = () => choreActions(chore(el.dataset.chore))));
+    $$("[data-pun]").forEach((el) => (el.onclick = () => punActions(pun(el.dataset.pun))));
     $$("[data-kidcard]").forEach((el) => (el.onclick = () => { S.tab = "money"; render(); }));
     $$("[data-pay]").forEach((b) => (b.onclick = () => payForm(kidById(Number(b.dataset.pay)))));
     $$("[data-adjust]").forEach((b) => (b.onclick = () => adjustForm(Number(b.dataset.adjust))));
@@ -657,13 +704,13 @@
   async function approve(c, btn) {
     await guard(btn, async () => {
       await api("POST", `/api/chores/${c.id}/approve`, {});
-      toast(`Approved${c.value_cents ? " · +" + money0(c.value_cents) + " to " + kidById(c.kid_id).name : ""} ✓`, "good");
+      toast(`Approved${c.value_cents ? " · +" + money0(c.value_cents) + " to " + c.rows.map((r) => kidById(r.kid_id).name).join(" & ") : ""} ✓`, "good");
       await refresh();
     });
   }
 
   function denyForm(c) {
-    sheet("Send back?", `<p style="margin-top:0"><b>${esc(c.title)}</b> · ${esc(kidById(c.kid_id).name)}</p>
+    sheet("Send back?", `<p style="margin-top:0"><b>${esc(c.title)}</b> · ${c.rows.map((r) => esc(kidById(r.kid_id).name)).join(" & ")}</p>
       <label class="field"><span>What still needs doing? (they'll see this)</span><textarea class="input" id="dn" maxlength="300" placeholder="Toys are still on the floor"></textarea></label>
       <div class="sheet-actions"><button class="btn plain" data-close>Cancel</button><button class="btn bad" id="go">Send back</button></div>`, (el, close) => {
       $("#go", el).onclick = (e) => guard(e.currentTarget, async () => { await api("POST", `/api/chores/${c.id}/deny`, { note: $("#dn", el).value }); close(); toast("Sent back"); await refresh(); });
@@ -675,12 +722,12 @@
     const open = ["todo", "denied", "submitted"].includes(c.status);
     sheet(esc(c.title), `${choreItem(c, { actions: false }).replace("tap", "")}
       <div class="action-list" style="margin-top:14px">
-        ${open ? `<button class="btn good" id="a-ok">✓ Approve${c.value_cents ? " · +" + money0(c.value_cents) : ""}</button>` : ""}
+        ${open ? `<button class="btn good" id="a-ok">✓ Approve${c.value_cents ? " · +" + money0(c.value_cents) + each(c) : ""}</button>` : ""}
         ${c.status === "submitted" ? `<button class="btn soft-bad" id="a-deny">✕ Send back</button>` : ""}
         ${["todo", "denied"].includes(c.status) ? `<button class="btn plain" id="a-miss">🙈 Mark as missed${c.repeat !== "none" ? " (next one gets scheduled)" : ""}</button>` : ""}
         ${open ? `<button class="btn plain" id="a-edit">✏️ Edit</button>` : ""}
         <button class="btn plain" id="a-dup">📄 Duplicate</button>
-        <button class="btn soft-bad" id="a-del">🗑 Delete${c.status === "approved" && c.value_cents ? " (takes back " + money0(c.value_cents) + ")" : ""}</button>
+        <button class="btn soft-bad" id="a-del">🗑 Delete${c.status === "approved" && c.value_cents ? " (takes back " + money0(c.value_cents) + each(c) + ")" : ""}</button>
       </div>`, (el, close) => {
       const on = (id, fn) => { const b = $(id, el); if (b) b.onclick = fn; };
       on("#a-ok", (e) => { close(); approve(c, e.currentTarget); });
@@ -696,6 +743,19 @@
     return `<div class="chips" data-chips="multi" id="kids">${S.data.kids.map((k) => `<button type="button" class="chip kidchip ${selected.includes(k.id) ? "on" : ""}" style="--c:${k.color}" data-v="${k.id}"><span class="dot"></span>${esc(k.name)}</button>`).join("")}</div>`;
   }
 
+  // "Each on their own" / "Together" chips, only shown when 2+ kids are picked
+  function togetherChips(on, eachLabel, togLabel) {
+    return `<div class="chips" data-chips="single" id="tog" style="margin:-6px 0 14px"><button type="button" class="chip ${on ? "" : "on"}" data-v="0">${eachLabel}</button><button type="button" class="chip ${on ? "on" : ""}" data-v="1">${togLabel}</button></div>`;
+  }
+  function wireTogether(el) {
+    const tog = $("#tog", el), kids = $("#kids", el);
+    if (!tog || !kids) return;
+    const sync = () => tog.classList.toggle("hidden", chipVals(kids).length < 2);
+    kids.addEventListener("change", sync);
+    sync();
+  }
+  const isTogether = (el) => !!$("#tog", el) && !$("#tog", el).classList.contains("hidden") && chipVals($("#tog", el))[0] === "1";
+
   function quickDue(kind) {
     const d = new Date(nowMs());
     if (kind === "tonight") { d.setHours(20, 0, 0, 0); if (d < nowMs()) d.setDate(d.getDate() + 1); }
@@ -707,11 +767,13 @@
 
   function choreForm(c = null) {
     const edit = c && c.id;
-    const kidsSel = c ? [c.kid_id] : S.kidFilter !== "all" ? [Number(S.kidFilter)] : S.data.kids.length === 1 ? [S.data.kids[0].id] : [];
+    const kidsSel = c ? (c.rows || [c]).map((r) => r.kid_id) : S.kidFilter !== "all" ? [Number(S.kidFilter)] : S.data.kids.length === 1 ? [S.data.kids[0].id] : [];
+    const togOn = !!(c && c.rows && c.rows.length > 1);
     sheet(edit ? "Edit chore" : "New chore", `
       <label class="field"><span>What needs doing?</span><input class="input" id="t" maxlength="80" value="${esc(c?.title || "")}" placeholder="Clean your room"></label>
       <div class="chips" style="margin:-6px 0 14px" id="sugg">${["Make bed", "Clean room", "Dishes", "Take out trash", "Feed the cat", "Homework", "Vacuum", "Laundry"].map((s) => `<button type="button" class="chip" data-s="${s}">${s}</button>`).join("")}</div>
-      ${edit ? "" : `<label class="field"><span>For who?</span>${kidChips(kidsSel)}</label>`}
+      ${edit ? "" : `<label class="field"><span>For who?</span>${kidChips(kidsSel)}</label>
+        ${togetherChips(togOn, "Each on their own", "🤝 Together, all must finish")}`}
       <label class="field"><span>Reward</span><div class="money-input"><input class="input" id="v" inputmode="decimal" value="${c ? (c.value_cents / 100).toFixed(2) : ""}" placeholder="0.00"></div></label>
       <div class="chips" style="margin:-6px 0 14px" id="vq">${[0.5, 1, 2, 5, 10].map((v) => `<button type="button" class="chip" data-v="${v}">$${v < 1 ? v.toFixed(2) : v}</button>`).join("")}</div>
       <label class="field"><span>Deadline</span><input class="input" id="due" type="datetime-local" value="${toLocalInput(c?.due_at)}"></label>
@@ -720,13 +782,14 @@
       <label class="field"><span>Notes (optional)</span><textarea class="input" id="n" maxlength="500" placeholder="Details for the kids">${esc(c?.notes || "")}</textarea></label>
       <div class="sheet-actions"><button class="btn plain" data-close>Cancel</button><button class="btn" id="save">${edit ? "Save" : "Add chore"}</button></div>`, (el, close) => {
       wireChips(el);
+      wireTogether(el);
       $("#sugg", el).onclick = (e) => { const b = e.target.closest("[data-s]"); if (b) $("#t", el).value = b.dataset.s; };
       $("#vq", el).onclick = (e) => { const b = e.target.closest("[data-v]"); if (b) $("#v", el).value = Number(b.dataset.v).toFixed(2); };
       $("#dq", el).onclick = (e) => { const b = e.target.closest("[data-d]"); if (b) $("#due", el).value = b.dataset.d ? quickDue(b.dataset.d) : ""; };
       $("#save", el).onclick = (e) => guard(e.currentTarget, async () => {
         const payload = { title: $("#t", el).value, value: $("#v", el).value || 0, due_at: fromLocalInput($("#due", el).value), repeat: chipVals($("#rep", el))[0] || "none", notes: $("#n", el).value };
         if (edit) await api("PUT", `/api/chores/${c.id}`, payload);
-        else await api("POST", "/api/chores", { ...payload, kid_ids: chipVals($("#kids", el)).map(Number) });
+        else await api("POST", "/api/chores", { ...payload, kid_ids: chipVals($("#kids", el)).map(Number), together: isTogether(el) });
         close(); toast(edit ? "Saved" : "Chore added 🧹", "good"); await refresh();
       });
     });
@@ -737,6 +800,7 @@
     const durs = [[0, "No timer"], [60, "1 hour"], [180, "3 hours"], [1440, "1 day"], [4320, "3 days"], [10080, "1 week"], ["custom", "Custom…"]];
     sheet("New consequence", `
       <label class="field"><span>For who?</span>${kidChips(kidsSel)}</label>
+      ${togetherChips(true, "Separately", "🤝 Together")}
       <label class="field"><span>What's the consequence?</span><input class="input" id="t" maxlength="80" placeholder="No tablet"></label>
       <div class="chips" style="margin:-6px 0 14px" id="sugg">${["No tablet", "No TV", "No video games", "No phone", "Early bedtime", "No sweets", "Fine only"].map((s) => `<button type="button" class="chip" data-s="${s}">${s}</button>`).join("")}</div>
       <label class="field"><span>Why? (they'll see this)</span><input class="input" id="r" maxlength="300" placeholder="Talked back at dinner"></label>
@@ -746,13 +810,14 @@
       <div class="chips" style="margin:-6px 0 14px" id="fq">${[0, 0.5, 1, 2, 5].map((v) => `<button type="button" class="chip" data-v="${v}">${v ? "−$" + (v < 1 ? v.toFixed(2) : v) : "None"}</button>`).join("")}</div>
       <div class="sheet-actions"><button class="btn plain" data-close>Cancel</button><button class="btn bad" id="save">Give consequence</button></div>`, (el, close) => {
       wireChips(el);
+      wireTogether(el);
       $("#sugg", el).onclick = (e) => { const b = e.target.closest("[data-s]"); if (!b) return; $("#t", el).value = b.dataset.s; if (b.dataset.s === "Fine only") { $$("#dur .chip", el).forEach((c) => c.classList.toggle("on", c.dataset.v === "0")); $("#custom", el).classList.add("hidden"); } };
       $("#fq", el).onclick = (e) => { const b = e.target.closest("[data-v]"); if (b) $("#f", el).value = Number(b.dataset.v) ? Number(b.dataset.v).toFixed(2) : ""; };
       $("#dur", el).addEventListener("change", () => $("#custom", el).classList.toggle("hidden", chipVals($("#dur", el))[0] !== "custom"));
       $("#save", el).onclick = (e) => guard(e.currentTarget, async () => {
         let dv = chipVals($("#dur", el))[0] || "0";
         const minutes = dv === "custom" ? Math.round(Number($("#cn", el).value) * Number($("#cu", el).value)) : Number(dv);
-        await api("POST", "/api/punishments", { kid_ids: chipVals($("#kids", el)).map(Number), title: $("#t", el).value, reason: $("#r", el).value, fine: $("#f", el).value || 0, duration_minutes: minutes });
+        await api("POST", "/api/punishments", { kid_ids: chipVals($("#kids", el)).map(Number), title: $("#t", el).value, reason: $("#r", el).value, fine: $("#f", el).value || 0, duration_minutes: minutes, together: isTogether(el) });
         close(); toast("Consequence given"); await refresh();
       });
     });
@@ -766,7 +831,7 @@
         ${active ? `<div class="row" style="flex-wrap:wrap;gap:8px"><b class="grow">Add time:</b>${[[60, "+1h"], [1440, "+1 day"], [10080, "+1 week"]].map(([m, l]) => `<button class="btn plain sm" data-ext="${m}">${l}</button>`).join("")}</div>
           <div class="row" style="flex-wrap:wrap;gap:8px"><b class="grow">Take off:</b>${[[-30, "−30m"], [-60, "−1h"], [-1440, "−1 day"]].map(([m, l]) => `<button class="btn plain sm" data-ext="${m}">${l}</button>`).join("")}</div>
           <button class="btn good" id="a-end">✓ End it now (good behavior!)</button>` : ""}
-        ${p.status !== "cancelled" ? `<button class="btn soft-bad" id="a-cancel">✕ Cancel it${p.fine_cents ? " & refund " + money0(p.fine_cents) : ""}</button>` : ""}
+        ${p.status !== "cancelled" ? `<button class="btn soft-bad" id="a-cancel">✕ Cancel it${p.fine_cents ? " & refund " + money0(p.fine_cents) + each(p) : ""}</button>` : ""}
       </div>`, (el, close) => {
       $$("[data-ext]", el).forEach((b) => (b.onclick = () => guard(b, async () => { await api("POST", `/api/punishments/${p.id}/extend`, { minutes: Number(b.dataset.ext) }); close(); await refresh(); })));
       const end = $("#a-end", el); if (end) end.onclick = () => guard(end, async () => { await api("POST", `/api/punishments/${p.id}/end`); close(); toast("Ended", "good"); await refresh(); });
@@ -805,14 +870,14 @@
     const color = u?.color || COLORS[(S.data.kids.length + S.data.parents.length) % COLORS.length];
     sheet(u ? `Edit ${esc(u.name)}` : isKid ? "Add kid" : "Add parent", `
       <label class="field"><span>Name</span><input class="input" id="nm" maxlength="40" value="${esc(u?.name || "")}"></label>
-      <label class="field"><span>${u ? "New PIN (leave empty to keep)" : "PIN (4–8 digits)"}</span><input class="input" id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8" ${isKid ? "" : 'type="password"'}></label>
+      ${isKid ? "" : `<label class="field"><span>${u ? "New PIN (leave empty to keep)" : "PIN (4–8 digits)"}</span><input class="input" id="pin" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8"></label>`}
       <label class="field"><span>Color</span><div class="swatches" id="sw">${COLORS.map((c) => `<button type="button" class="swatch ${c === color ? "on" : ""}" style="background:${c}" data-v="${c}"></button>`).join("")}</div></label>
       ${isKid ? `<label class="field"><span>Jar size (full jar = this much)</span><div class="money-input"><input class="input" id="jar" inputmode="decimal" value="${((u?.jar_size_cents || 2000) / 100).toFixed(2)}"></div></label>
         <label class="field"><span>Saving for (optional)</span><input class="input" id="goal" maxlength="60" value="${esc(u?.goal_label || "")}" placeholder="New LEGO set"></label>` : ""}
       <div class="sheet-actions">${u ? `<button class="btn soft-bad" id="del">Remove</button>` : `<button class="btn plain" data-close>Cancel</button>`}<button class="btn" id="save">Save</button></div>`, (el, close) => {
       $("#sw", el).onclick = (e) => { const s = e.target.closest(".swatch"); if (!s) return; $$(".swatch", el).forEach((x) => x.classList.remove("on")); s.classList.add("on"); };
       $("#save", el).onclick = (e) => guard(e.currentTarget, async () => {
-        const payload = { name: $("#nm", el).value, pin: $("#pin", el).value, color: $(".swatch.on", el)?.dataset.v };
+        const payload = { name: $("#nm", el).value, pin: $("#pin", el)?.value || "", color: $(".swatch.on", el)?.dataset.v };
         if (isKid) Object.assign(payload, { jar_size: $("#jar", el).value, goal_label: $("#goal", el).value });
         if (u) await api("PUT", `/api/users/${u.id}`, payload);
         else await api("POST", "/api/users", { ...payload, role: isKid ? "kid" : "parent" });
