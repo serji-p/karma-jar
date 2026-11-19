@@ -15,7 +15,8 @@ install_caddy() {
   else
     case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported CPU $(uname -m)"; exit 1 ;; esac
     echo "Downloading Caddy with the DuckDNS plugin from caddyserver.com ..."
-    wget -q -O /tmp/caddy.new "https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com/caddy-dns/duckdns"
+    # caddyserver.com answers wget's user agent with a 22-byte "Contact the Caddy team" text
+    wget -q -U "curl/8.5.0" -O /tmp/caddy.new "https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com/caddy-dns/duckdns"
     chmod 755 /tmp/caddy.new
     /tmp/caddy.new list-modules | grep -q '^dns.providers.duckdns$' || { echo "download has no DuckDNS plugin"; exit 1; }
     mv /tmp/caddy.new /usr/local/bin/caddy
