@@ -796,8 +796,8 @@
     sheet(edit ? "Edit chore" : "New chore", `
       <label class="field"><span>What needs doing?</span><input class="input" id="t" maxlength="80" value="${esc(c?.title || "")}" placeholder="Clean your room"></label>
       <div class="chips" style="margin:-6px 0 14px" id="sugg">${["Make bed", "Clean room", "Dishes", "Take out trash", "Feed the cat", "Homework", "Vacuum", "Laundry"].map((s) => `<button type="button" class="chip" data-s="${s}">${s}</button>`).join("")}</div>
-      ${edit ? "" : `<label class="field"><span>For who?</span>${kidChips(kidsSel)}</label>
-        ${modeChips(CHORE_MODES, modeSel)}`}
+      <label class="field"><span>For who?</span>${kidChips(kidsSel)}</label>
+      ${modeChips(CHORE_MODES, modeSel)}
       <label class="field"><span>Reward</span><div class="money-input"><input class="input" id="v" inputmode="decimal" value="${c ? (c.value_cents / 100).toFixed(2) : ""}" placeholder="0.00"></div></label>
       <div class="chips" style="margin:-6px 0 14px" id="vq">${[0.5, 1, 2, 5, 10].map((v) => `<button type="button" class="chip" data-v="${v}">$${v < 1 ? v.toFixed(2) : v}</button>`).join("")}</div>
       <label class="field"><span>Deadline</span><input class="input" id="due" type="datetime-local" value="${toLocalInput(c?.due_at)}"></label>
@@ -811,9 +811,10 @@
       $("#vq", el).onclick = (e) => { const b = e.target.closest("[data-v]"); if (b) $("#v", el).value = Number(b.dataset.v).toFixed(2); };
       $("#dq", el).onclick = (e) => { const b = e.target.closest("[data-d]"); if (b) $("#due", el).value = b.dataset.d ? quickDue(b.dataset.d) : ""; };
       $("#save", el).onclick = (e) => guard(e.currentTarget, async () => {
-        const payload = { title: $("#t", el).value, value: $("#v", el).value || 0, due_at: fromLocalInput($("#due", el).value), repeat: chipVals($("#rep", el))[0] || "none", notes: $("#n", el).value };
+        const payload = { title: $("#t", el).value, value: $("#v", el).value || 0, due_at: fromLocalInput($("#due", el).value), repeat: chipVals($("#rep", el))[0] || "none", notes: $("#n", el).value,
+          kid_ids: chipVals($("#kids", el)).map(Number), mode: modeVal(el) };
         if (edit) await api("PUT", `/api/chores/${c.id}`, payload);
-        else await api("POST", "/api/chores", { ...payload, kid_ids: chipVals($("#kids", el)).map(Number), mode: modeVal(el) });
+        else await api("POST", "/api/chores", payload);
         close(); toast(edit ? "Saved" : "Chore added 🧹", "good"); await refresh();
       });
     });
