@@ -153,7 +153,10 @@ It installs Caddy with the DuckDNS plugin (from caddyserver.com), offers to poin
 - If the name doesn't resolve at home, your router has **DNS rebinding protection** and drops
   public names that point at private IPs. Add an exception for `duckdns.org` (or this name), or a
   local DNS entry `karmajar.duckdns.org → <server IP>` in the router or Pi-hole.
-- The old `http://<server>:8080` address keeps working until you close it.
+- The old `http://<server>:8080` address keeps working until you run `karma-jar-https only`.
+  That makes the app listen only for Caddy and sends the login cookie over HTTPS only, so anything
+  still using `:8080` (old home-screen shortcuts, Home Assistant, agents) must switch to the
+  `https://` address. `karma-jar-https only off` undoes it.
 
 ### Option A: Caddy with its own local CA (no domain needed)
 
@@ -288,7 +291,7 @@ network, so callers have to be at home (or on Tailscale, see section 3).
 Quick test from any machine at home:
 
 ```bash
-curl -s -X POST http://192.168.1.110:8080/api/ext/chores \
+curl -s -X POST https://karmajar.duckdns.org/api/ext/chores \
   -H "Authorization: Bearer kj_YOUR_TOKEN" -H "Content-Type: application/json" \
   -d '{"title": "Feed the cat", "kids": "Ben", "reward": 0.5, "due_in_minutes": 60}'
 ```
@@ -300,7 +303,7 @@ curl -s -X POST http://192.168.1.110:8080/api/ext/chores \
 ```yaml
 rest_command:
   karma_jar_chore:
-    url: "http://192.168.1.110:8080/api/ext/chores"
+    url: "https://karmajar.duckdns.org/api/ext/chores"
     method: post
     headers:
       Authorization: !secret karma_jar_auth
@@ -363,7 +366,7 @@ Optional: a sensor showing how many chores are open, for a dashboard card.
 
 ```yaml
 rest:
-  - resource: "http://192.168.1.110:8080/api/ext/chores"
+  - resource: "https://karmajar.duckdns.org/api/ext/chores"
     headers:
       Authorization: !secret karma_jar_auth
     scan_interval: 300
@@ -375,7 +378,7 @@ rest:
 ### AI agents (Claude Code, Duet, ...)
 
 Create a token named after the agent and give it to the agent as environment variables, for
-example `KARMA_JAR_URL=http://192.168.1.110:8080` and `KARMA_JAR_TOKEN=kj_...`. Then add this to the
+example `KARMA_JAR_URL=https://karmajar.duckdns.org` and `KARMA_JAR_TOKEN=kj_...`. Then add this to the
 agent's instructions (for Claude Code, a `CLAUDE.md` or a skill):
 
 > To give the kids a chore in Karma Jar, call the API at `$KARMA_JAR_URL` with header

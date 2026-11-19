@@ -2,6 +2,7 @@
 # Turn on HTTPS for Karma Jar with a DuckDNS name. Run ON the server, as root:
 #   karma-jar-https install              # install Caddy with the DuckDNS plugin (no settings needed)
 #   karma-jar-https setup <subdomain>    # e.g. karmajar or karmajar.duckdns.org; asks for the token
+#   karma-jar-https only [off]           # HTTPS only: app listens on localhost, login cookie HTTPS-only
 #   karma-jar-https status
 # The app stays private: the DuckDNS name points at this server's home-network address and
 # the certificate is issued through a DNS record, so nothing is opened to the internet.
@@ -74,16 +75,45 @@ setup() {
   echo "No certificate yet. Recent Caddy log:"; journalctl -u caddy -n 20 --no-pager; exit 1
 }
 
+DEFAULTS=/etc/default/karma-jar
+
+set_default() {  # set_default KEY VALUE, or just KEY to remove it
+  touch "$DEFAULTS"
+  sed -i "/^$1=/d" "$DEFAULTS"
+  if [ -n "${2:-}" ]; then echo "$1=$2" >> "$DEFAULTS"; fi
+}
+
+https_only() {
+  if [ "${1:-}" = off ]; then
+    set_default KARMA_BIND
+    set_default KARMA_SECURE_COOKIES
+    systemctl restart karma-jar
+    echo "Port 8080 is open on the network again, and login works over plain HTTP."
+    return
+  fi
+  if ! [ -f "$ENV" ] || ! systemctl is-active -q caddy; then
+    echo "Run 'karma-jar-https setup <subdomain>' first."; exit 1
+  fi
+  set_default KARMA_BIND 127.0.0.1:8080
+  set_default KARMA_SECURE_COOKIES 1
+  systemctl restart karma-jar
+  sleep 2
+  systemctl is-active -q karma-jar || { journalctl -u karma-jar -n 20 --no-pager; exit 1; }
+  echo "HTTPS only: https://$(sed -n 's/^KARMA_DOMAIN=//p' "$ENV") (port 8080 now answers only on this server)."
+}
+
 status() {
   systemctl is-active caddy || true
   [ -f "$ENV" ] && sed -n 's/^KARMA_DOMAIN=/domain: /p' "$ENV"
   ls /var/lib/caddy/.local/share/caddy/certificates/*/ 2>/dev/null || echo "no certificate yet"
+  if grep -q '^KARMA_BIND=127.0.0.1' "$DEFAULTS" 2>/dev/null; then echo "HTTPS only"; else echo "port 8080 also open on the network"; fi
 }
 
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 case "${1:-}" in
   install) install_caddy ;;
   setup) shift; setup "$@" ;;
+  only) shift; https_only "$@" ;;
   status) status ;;
-  *) sed -n '2,7p' "$0"; exit 1 ;;
+  *) sed -n '2,8p' "$0"; exit 1 ;;
 esac

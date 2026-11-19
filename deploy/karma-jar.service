@@ -8,9 +8,11 @@ User=karma
 Group=karma
 WorkingDirectory=/opt/karma-jar
 Environment=KARMA_DATA_DIR=/var/lib/karma-jar
+Environment=KARMA_BIND=0.0.0.0:8080
+# Overrides the above. `karma-jar-https only` puts KARMA_BIND=127.0.0.1:8080 and KARMA_SECURE_COOKIES=1 here.
 EnvironmentFile=-/etc/default/karma-jar
 # One worker only: the PIN lockout is in memory and SQLite wants a single writer.
-ExecStart=/opt/karma-jar/.venv/bin/gunicorn -w 1 --threads 8 -b 0.0.0.0:8080 --access-logfile - --no-control-socket app:app
+ExecStart=/opt/karma-jar/.venv/bin/gunicorn -w 1 --threads 8 -b ${KARMA_BIND} --access-logfile - --no-control-socket app:app
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
