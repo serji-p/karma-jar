@@ -432,8 +432,11 @@
     const choreCard = (c) => {
       const due = dueInfo(c);
       const mates = c.mates || [];
-      const notYet = mates.filter((m) => !["submitted", "approved"].includes(m.status));
-      const withPill = mates.length ? `<span class="pill brand">🤝 with ${mates.map((m) => esc(m.name) + (["submitted", "approved"].includes(m.status) ? " ✓" : "")).join(" & ")}</span>` : "";
+      const first = c.group_mode === "first" && mates.length > 0;
+      const notYet = first ? [] : mates.filter((m) => !["submitted", "approved"].includes(m.status));
+      const withPill = first
+        ? (["todo", "denied"].includes(c.status) ? `<span class="pill brand">🏃 First one gets it · ${mates.map((m) => esc(m.name)).join(" & ")} can too</span>` : "")
+        : mates.length ? `<span class="pill brand">🤝 with ${mates.map((m) => esc(m.name) + (["submitted", "approved"].includes(m.status) ? " ✓" : "")).join(" & ")}</span>` : "";
       if (c.status === "submitted") return `<div class="card kid-chore waiting" style="--c:${me.color}">
           <div class="grow"><div class="title">${esc(c.title)}</div><div class="sub">${notYet.length
             ? `<span class="pill warn">⏳ Waiting for ${notYet.map((m) => esc(m.name)).join(" & ")} to finish too</span>`
@@ -523,14 +526,20 @@
     for (const it of out) if (it.rows.length > 1) it.status = groupStatus(it.rows.map((r) => r.status));
     return out;
   }
-  function groupStatus(st) {
+  function groupStatus(all) {
+    const st = all.filter((x) => x !== "taken"); // "first one" chores: the others' rows don't count
+    if (!st.length) return "approved";
     if (st.every((x) => x === st[0])) return st[0];
     if (st.includes("active")) return "active";
     if (st.includes("denied")) return "denied";
     return "todo"; // some kids marked it done, others not yet
   }
   const stripeStyle = (it) => it.rows.length > 1 ? `style="background:linear-gradient(${it.rows.map((r) => kidById(r.kid_id).color).join(",")})"` : "";
-  const each = (it) => (it.rows.length > 1 ? " each" : "");
+  const isFirst = (it) => it.rows.length > 1 && it.group_mode === "first";
+  const each = (it) => (it.rows.length > 1 && !isFirst(it) ? " each" : "");
+  const doer = (it) => it.rows.find((r) => ["submitted", "approved"].includes(r.status)); // who did a "first one" chore
+  const payeeNames = (it) => (isFirst(it) ? [doer(it)].filter(Boolean) : it.rows).map((r) => kidById(r.kid_id).name).join(" & ");
+  const CHORE_MODES = [["each", "Each on their own"], ["together", "🤝 Together, all must finish"], ["first", "🏃 First one to do it"]];
 
   function renderParent() {
     const d = S.data;
@@ -572,7 +581,10 @@
   function choreItem(c, { actions = true } = {}) {
     const due = dueInfo(c);
     const open = ["todo", "denied"].includes(c.status);
-    const who = c.rows.length > 1
+    const dd = isFirst(c) && doer(c);
+    const who = isFirst(c)
+      ? `<span class="pill brand">🏃 ${dd ? (dd.status === "submitted" ? "✓ " : "") + esc(kidById(dd.kid_id).name) : c.rows.map((r) => esc(kidById(r.kid_id).name)).join(" or ")}</span>`
+      : c.rows.length > 1
       ? `<span class="pill brand">🤝 ${c.rows.map((r) => (open ? (r.status === "submitted" ? "✓ " : "⏳ ") : "") + esc(kidById(r.kid_id).name)).join(open ? " · " : " + ")}</span>`
       : `<b style="color:var(--ink)">${esc(kidById(c.kid_id).name)}</b>`;
     const kidNotes = c.rows.filter((r) => r.kid_note).map((r) => `<div class="note">💬 ${c.rows.length > 1 ? esc(kidById(r.kid_id).name) + ": " : ""}“${esc(r.kid_note)}”</div>`).join("");
@@ -716,7 +728,7 @@
   async function approve(c, btn) {
     await guard(btn, async () => {
       await api("POST", `/api/chores/${c.id}/approve`, {});
-      toast(`Approved${c.value_cents ? " · +" + money0(c.value_cents) + " to " + c.rows.map((r) => kidById(r.kid_id).name).join(" & ") : ""} ✓`, "good");
+      toast(`Approved${c.value_cents ? " · +" + money0(c.value_cents) + " to " + payeeNames(c) : ""} ✓`, "good");
       await refresh();
     });
   }
@@ -755,9 +767,9 @@
     return `<div class="chips" data-chips="multi" id="kids">${S.data.kids.map((k) => `<button type="button" class="chip kidchip ${selected.includes(k.id) ? "on" : ""}" style="--c:${k.color}" data-v="${k.id}"><span class="dot"></span>${esc(k.name)}</button>`).join("")}</div>`;
   }
 
-  // "Each on their own" / "Together" chips, only shown when 2+ kids are picked
-  function togetherChips(on, eachLabel, togLabel) {
-    return `<div class="chips" data-chips="single" id="tog" style="margin:-6px 0 14px"><button type="button" class="chip ${on ? "" : "on"}" data-v="0">${eachLabel}</button><button type="button" class="chip ${on ? "on" : ""}" data-v="1">${togLabel}</button></div>`;
+  // "Each on their own" / "Together" / "First one" chips, only shown when 2+ kids are picked
+  function modeChips(opts, sel) {
+    return `<div class="chips" data-chips="single" id="tog" style="margin:-6px 0 14px">${opts.map(([v, l]) => `<button type="button" class="chip ${v === sel ? "on" : ""}" data-v="${v}">${l}</button>`).join("")}</div>`;
   }
   function wireTogether(el) {
     const tog = $("#tog", el), kids = $("#kids", el);
@@ -766,7 +778,7 @@
     kids.addEventListener("change", sync);
     sync();
   }
-  const isTogether = (el) => !!$("#tog", el) && !$("#tog", el).classList.contains("hidden") && chipVals($("#tog", el))[0] === "1";
+  const modeVal = (el) => { const t = $("#tog", el); return t && !t.classList.contains("hidden") ? chipVals(t)[0] || "each" : "each"; };
 
   function quickDue(kind) {
     const d = new Date(nowMs());
@@ -780,12 +792,12 @@
   function choreForm(c = null) {
     const edit = c && c.id;
     const kidsSel = c ? (c.rows || [c]).map((r) => r.kid_id) : S.kidFilter !== "all" ? [Number(S.kidFilter)] : S.data.kids.length === 1 ? [S.data.kids[0].id] : [];
-    const togOn = !!(c && c.rows && c.rows.length > 1);
+    const modeSel = c && c.rows && c.rows.length > 1 ? c.group_mode || "together" : "each";
     sheet(edit ? "Edit chore" : "New chore", `
       <label class="field"><span>What needs doing?</span><input class="input" id="t" maxlength="80" value="${esc(c?.title || "")}" placeholder="Clean your room"></label>
       <div class="chips" style="margin:-6px 0 14px" id="sugg">${["Make bed", "Clean room", "Dishes", "Take out trash", "Feed the cat", "Homework", "Vacuum", "Laundry"].map((s) => `<button type="button" class="chip" data-s="${s}">${s}</button>`).join("")}</div>
       ${edit ? "" : `<label class="field"><span>For who?</span>${kidChips(kidsSel)}</label>
-        ${togetherChips(togOn, "Each on their own", "🤝 Together, all must finish")}`}
+        ${modeChips(CHORE_MODES, modeSel)}`}
       <label class="field"><span>Reward</span><div class="money-input"><input class="input" id="v" inputmode="decimal" value="${c ? (c.value_cents / 100).toFixed(2) : ""}" placeholder="0.00"></div></label>
       <div class="chips" style="margin:-6px 0 14px" id="vq">${[0.5, 1, 2, 5, 10].map((v) => `<button type="button" class="chip" data-v="${v}">$${v < 1 ? v.toFixed(2) : v}</button>`).join("")}</div>
       <label class="field"><span>Deadline</span><input class="input" id="due" type="datetime-local" value="${toLocalInput(c?.due_at)}"></label>
@@ -801,7 +813,7 @@
       $("#save", el).onclick = (e) => guard(e.currentTarget, async () => {
         const payload = { title: $("#t", el).value, value: $("#v", el).value || 0, due_at: fromLocalInput($("#due", el).value), repeat: chipVals($("#rep", el))[0] || "none", notes: $("#n", el).value };
         if (edit) await api("PUT", `/api/chores/${c.id}`, payload);
-        else await api("POST", "/api/chores", { ...payload, kid_ids: chipVals($("#kids", el)).map(Number), together: isTogether(el) });
+        else await api("POST", "/api/chores", { ...payload, kid_ids: chipVals($("#kids", el)).map(Number), mode: modeVal(el) });
         close(); toast(edit ? "Saved" : "Chore added 🧹", "good"); await refresh();
       });
     });
@@ -812,7 +824,7 @@
     const durs = [[0, "No timer"], [60, "1 hour"], [180, "3 hours"], [1440, "1 day"], [4320, "3 days"], [10080, "1 week"], ["custom", "Custom…"]];
     sheet("New consequence", `
       <label class="field"><span>For who?</span>${kidChips(kidsSel)}</label>
-      ${togetherChips(true, "Separately", "🤝 Together")}
+      ${modeChips([["each", "Separately"], ["together", "🤝 Together"]], "together")}
       <label class="field"><span>What's the consequence?</span><input class="input" id="t" maxlength="80" placeholder="No tablet"></label>
       <div class="chips" style="margin:-6px 0 14px" id="sugg">${["No tablet", "No TV", "No video games", "No phone", "Early bedtime", "No sweets", "Fine only"].map((s) => `<button type="button" class="chip" data-s="${s}">${s}</button>`).join("")}</div>
       <label class="field"><span>Why? (they'll see this)</span><input class="input" id="r" maxlength="300" placeholder="Talked back at dinner"></label>
@@ -829,7 +841,7 @@
       $("#save", el).onclick = (e) => guard(e.currentTarget, async () => {
         let dv = chipVals($("#dur", el))[0] || "0";
         const minutes = dv === "custom" ? Math.round(Number($("#cn", el).value) * Number($("#cu", el).value)) : Number(dv);
-        await api("POST", "/api/punishments", { kid_ids: chipVals($("#kids", el)).map(Number), title: $("#t", el).value, reason: $("#r", el).value, fine: $("#f", el).value || 0, duration_minutes: minutes, together: isTogether(el) });
+        await api("POST", "/api/punishments", { kid_ids: chipVals($("#kids", el)).map(Number), title: $("#t", el).value, reason: $("#r", el).value, fine: $("#f", el).value || 0, duration_minutes: minutes, together: modeVal(el) === "together" });
         close(); toast("Consequence given"); await refresh();
       });
     });

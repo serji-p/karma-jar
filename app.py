@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS chores (
     submitted_at TEXT,
     decided_at TEXT,
     decided_by INTEGER,
-    group_id INTEGER,  -- "together" chores: one row per kid, same group_id
+    group_id INTEGER,  -- shared chores: one row per kid, same group_id
+    group_mode TEXT NOT NULL DEFAULT 'together',  -- together = everyone must do it, first = first kid to do it gets it
     ext_key TEXT,  -- set by API callers so repeated calls don't create duplicates
     source TEXT NOT NULL DEFAULT ''  -- name of the API token that created it ('' = a parent)
 );
@@ -156,7 +157,8 @@ def init_db():
     conn.executescript(SCHEMA)
     # migrate databases created by older versions
     for table, col, ddl in (("chores", "group_id", "INTEGER"), ("punishments", "group_id", "INTEGER"),
-                            ("chores", "ext_key", "TEXT"), ("chores", "source", "TEXT NOT NULL DEFAULT ''")):
+                            ("chores", "ext_key", "TEXT"), ("chores", "source", "TEXT NOT NULL DEFAULT ''"),
+                            ("chores", "group_mode", "TEXT NOT NULL DEFAULT 'together'")):
         if col not in [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
     for table in ("chores", "punishments"):
@@ -411,7 +413,7 @@ def data():
             me=kid,
             rev=_rev["n"],
             chores=with_mates("chores", rows(
-                "SELECT * FROM chores WHERE kid_id=? AND (status IN ('todo','submitted','denied') OR decided_at >= ?) ORDER BY "
+                "SELECT * FROM chores WHERE kid_id=? AND status <> 'taken' AND (status IN ('todo','submitted','denied') OR decided_at >= ?) ORDER BY "
                 "CASE status WHEN 'denied' THEN 0 WHEN 'todo' THEN 1 WHEN 'submitted' THEN 2 ELSE 3 END, due_at IS NULL, due_at, id",
                 (u["id"], cutoff),
             )),
@@ -430,7 +432,7 @@ def data():
         kids=kids,
         parents=rows("SELECT id, name, color FROM users WHERE role='parent' ORDER BY id"),
         chores=rows(
-            "SELECT * FROM chores WHERE status IN ('todo','submitted','denied') OR decided_at >= ? ORDER BY "
+            "SELECT * FROM chores WHERE status IN ('todo','submitted','denied') OR (status='taken' AND decided_at IS NULL) OR decided_at >= ? ORDER BY "
             "CASE status WHEN 'submitted' THEN 0 WHEN 'todo' THEN 1 WHEN 'denied' THEN 1 ELSE 2 END, due_at IS NULL, due_at, id",
             (cutoff,),
         ),
@@ -451,10 +453,22 @@ def group_of(table, item):
     return [item]
 
 
-def link_group(table, ids):
-    """Give rows a shared group_id (the first row's id)."""
+def link_group(table, ids, mode=None):
+    """Give rows a shared group_id (the first row's id); chores also get their group_mode."""
     if len(ids) > 1:
-        db().execute(f"UPDATE {table} SET group_id=? WHERE id IN ({','.join('?' * len(ids))})", (ids[0], *ids))
+        marks = ",".join("?" * len(ids))
+        db().execute(f"UPDATE {table} SET group_id=? WHERE id IN ({marks})", (ids[0], *ids))
+        if mode:
+            db().execute(f"UPDATE {table} SET group_mode=? WHERE id IN ({marks})", (mode, *ids))
+
+
+def chore_mode(b):
+    """each (one chore per kid), together (all must finish) or first (first kid to do it gets it)."""
+    m = str(b.get("mode") or "").strip().lower()
+    m = {"all": "together", "any": "first", "first one": "first"}.get(m, m)
+    if m in ("together", "first", "each"):
+        return m
+    return "together" if b.get("together") else "each"
 
 
 def with_mates(table, items):
@@ -490,12 +504,12 @@ def create_chore():
         abort(400, "Pick at least one kid")
     repeat = b.get("repeat") if b.get("repeat") in REPEATS else "none"
     insert_chores(kid_ids, title, clean(b.get("notes"), 500), cents(b.get("value")), parse_dt(b.get("due_at")),
-                  repeat, bool(b.get("together")), created_by=g.user["id"])
+                  repeat, chore_mode(b), created_by=g.user["id"])
     db().commit()
     return jsonify(ok=True)
 
 
-def insert_chores(kid_ids, title, notes, value, due, repeat="none", together=False, created_by=None, ext_key=None, source=""):
+def insert_chores(kid_ids, title, notes, value, due, repeat="none", mode="each", created_by=None, ext_key=None, source=""):
     t = iso(now())
     ids = []
     for kid_id in kid_ids:
@@ -505,8 +519,8 @@ def insert_chores(kid_ids, title, notes, value, due, repeat="none", together=Fal
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (kid_id, title, notes, value, iso(due), repeat, created_by, t, ext_key or None, source),
         ).lastrowid)
-    if together:  # done together: only counts once every kid has marked it done
-        link_group("chores", ids)
+    if mode in ("together", "first"):
+        link_group("chores", ids, mode)
     return ids
 
 
@@ -537,18 +551,40 @@ def delete_chore(cid):
     return jsonify(ok=True)
 
 
+CHORE_OPEN = ("todo", "submitted", "denied")
+
+
+def first_mode(c):
+    return bool(c.get("group_id")) and c.get("group_mode") == "first"
+
+
+def taken_message(c):
+    who = one("SELECT u.name FROM chores c JOIN users u ON u.id = c.kid_id WHERE c.group_id=? "
+              "AND c.status IN ('submitted','approved') LIMIT 1", (c["group_id"],)) if c.get("group_id") else None
+    return f"{who['name']} already did this one!" if who else "Someone already did this one!"
+
+
 @app.post("/api/chores/<int:cid>/submit")
 @require("kid")
 def submit_chore(cid):
     c = chore_or_404(cid)
     if c["kid_id"] != g.user["id"]:
         abort(403)
+    if c["status"] == "taken":
+        abort(400, taken_message(c))
     if c["status"] not in ("todo", "denied"):
         abort(400, "Already sent")
-    db().execute(
-        "UPDATE chores SET status='submitted', submitted_at=?, kid_note=? WHERE id=?",
+    # Conditional update: for a "first one" chore two kids can tap at the same moment. SQLite
+    # serialises the writes, and whoever comes second finds their own row already "taken".
+    cur = db().execute(
+        "UPDATE chores SET status='submitted', submitted_at=?, kid_note=? WHERE id=? AND status IN ('todo','denied')",
         (iso(now()), clean(body().get("note"), 300), cid),
     )
+    if cur.rowcount == 0:
+        abort(400, taken_message(c))
+    if first_mode(c):  # it's theirs now: it disappears from the other kids' lists
+        db().execute("UPDATE chores SET status='taken' WHERE group_id=? AND id<>? AND status IN ('todo','denied')",
+                     (c["group_id"], cid))
     db().commit()
     return jsonify(ok=True)
 
@@ -560,12 +596,14 @@ def unsubmit_chore(cid):
     if c["kid_id"] != g.user["id"] or c["status"] != "submitted":
         abort(400, "Can't undo")
     db().execute("UPDATE chores SET status='todo', submitted_at=NULL WHERE id=?", (cid,))
+    if first_mode(c):  # free again for everyone
+        db().execute("UPDATE chores SET status='todo' WHERE group_id=? AND status='taken'", (c["group_id"],))
     db().commit()
     return jsonify(ok=True)
 
 
 def spawn_next(grp):
-    """Schedule the next copy of a repeating chore (for every kid of a together chore)."""
+    """Schedule the next copy of a repeating chore (for every kid of a shared chore)."""
     c = grp[0]
     step = REPEATS.get(c["repeat"])
     if not step:
@@ -579,7 +617,7 @@ def spawn_next(grp):
         (r["kid_id"], r["title"], r["notes"], r["value_cents"], iso(nxt), r["repeat"], r["created_by"], iso(now())),
     ).lastrowid for r in grp]
     if c["group_id"]:
-        link_group("chores", ids)
+        link_group("chores", ids, c["group_mode"])
 
 
 @app.post("/api/chores/<int:cid>/approve")
@@ -587,20 +625,28 @@ def spawn_next(grp):
 def approve_chore(cid):
     c = chore_or_404(cid)
     grp = group_of("chores", c)
-    if all(r["status"] == "approved" for r in grp):
+    if all(r["status"] in ("approved", "taken") for r in grp):
         abort(400, "Already approved")
     b = body()
     value = cents(b["value"]) if "value" in b else c["value_cents"]
-    for r in grp:  # a together chore pays every kid in it
-        if r["status"] == "approved":
-            continue
+    t = iso(now())
+    if first_mode(c):  # only the kid who did it gets the reward
+        payees = [r for r in grp if r["status"] == "submitted"]
+        if not payees:
+            abort(400, "Nobody has marked it done yet")
+    else:  # a together chore pays every kid in it
+        payees = [r for r in grp if r["status"] != "approved"]
+    for r in payees:
         db().execute(
             "UPDATE chores SET status='approved', decided_at=?, decided_by=?, parent_note=?, value_cents=? WHERE id=?",
-            (iso(now()), g.user["id"], clean(b.get("note"), 300), value, r["id"]),
+            (t, g.user["id"], clean(b.get("note"), 300), value, r["id"]),
         )
         if value:
             ledger_add(r["kid_id"], value, "chore", r["title"], r["id"])
-    if c["status"] != "missed":  # "missed" already scheduled the next copy
+    if first_mode(c):  # closed for the others
+        db().execute("UPDATE chores SET status='taken', decided_at=? WHERE group_id=? AND status IN ('todo','denied','taken')",
+                     (t, c["group_id"]))
+    if not any(r["status"] == "missed" for r in grp):  # "missed" already scheduled the next copy
         spawn_next(grp)
     db().commit()
     return jsonify(ok=True)
@@ -610,13 +656,21 @@ def approve_chore(cid):
 @require("parent")
 def deny_chore(cid):
     c = chore_or_404(cid)
-    if c["status"] not in ("todo", "submitted", "denied"):
+    grp = group_of("chores", c)
+    if not any(r["status"] in CHORE_OPEN for r in grp):
         abort(400, "This chore is already finished")
-    db().execute(
-        "UPDATE chores SET status='denied', decided_at=?, decided_by=?, parent_note=? "
-        "WHERE (id=? OR (group_id IS NOT NULL AND group_id=?)) AND status IN ('todo','submitted','denied')",
-        (iso(now()), g.user["id"], clean(body().get("note"), 300), cid, c["group_id"]),
-    )
+    args = (iso(now()), g.user["id"], clean(body().get("note"), 300))
+    if first_mode(c):
+        # the kid who tried sees the note and can try again, and it's open to everyone again
+        db().execute("UPDATE chores SET status='denied', decided_at=?, decided_by=?, parent_note=? "
+                     "WHERE group_id=? AND status='submitted'", (*args, c["group_id"]))
+        db().execute("UPDATE chores SET status='todo' WHERE group_id=? AND status='taken'", (c["group_id"],))
+    else:
+        db().execute(
+            "UPDATE chores SET status='denied', decided_at=?, decided_by=?, parent_note=? "
+            "WHERE (id=? OR (group_id IS NOT NULL AND group_id=?)) AND status IN ('todo','submitted','denied')",
+            (*args, cid, c["group_id"]),
+        )
     db().commit()
     return jsonify(ok=True)
 
@@ -625,12 +679,12 @@ def deny_chore(cid):
 @require("parent")
 def missed_chore(cid):
     c = chore_or_404(cid)
-    if c["status"] not in ("todo", "submitted", "denied"):
-        abort(400, "This chore is already finished")
     grp = group_of("chores", c)
+    if not any(r["status"] in CHORE_OPEN for r in grp):
+        abort(400, "This chore is already finished")
     db().execute(
         "UPDATE chores SET status='missed', decided_at=?, decided_by=?, parent_note=? "
-        "WHERE (id=? OR (group_id IS NOT NULL AND group_id=?)) AND status IN ('todo','submitted','denied')",
+        "WHERE (id=? OR (group_id IS NOT NULL AND group_id=?)) AND status IN ('todo','submitted','denied','taken')",
         (iso(now()), g.user["id"], clean(body().get("note"), 300), cid, c["group_id"]),
     )
     spawn_next(grp)
@@ -819,7 +873,8 @@ def resolve_kids(v):
 def ext_chore(c):
     return {"id": c["id"], "title": c["title"], "kid": c["kid_name"], "kid_id": c["kid_id"], "status": c["status"],
             "reward": c["value_cents"] / 100, "due_at": c["due_at"], "key": c["ext_key"], "source": c["source"],
-            "together": bool(c["group_id"]), "created_at": c["created_at"]}
+            "mode": c["group_mode"] if c["group_id"] else "each",
+            "together": bool(c["group_id"]) and c["group_mode"] == "together", "created_at": c["created_at"]}
 
 
 EXT_HELP = {
@@ -833,7 +888,9 @@ EXT_HELP = {
             "reward": "dollars, e.g. 0.5 (default 0)",
             "due_in_minutes": "deadline from now, e.g. 120 (or due_at: ISO 8601 time)",
             "notes": "optional text the kids see",
-            "together": "true = one shared chore that only counts once every kid has done it",
+            "mode": "'each' (default: a separate chore per kid), 'together' (one shared chore that only counts once "
+                    "every kid has done it, each gets the reward) or 'first' (the first kid to do it gets it and it "
+                    "disappears for the others)",
             "key": "optional dedupe key, e.g. 'vacuum-clean-water'. While a chore with this key is still "
                    "open, a new request with the same key creates nothing and returns the existing chore.",
         },
@@ -904,7 +961,7 @@ def ext_create_chore():
         due = None
     reward = b.get("reward", b.get("value"))
     ids = insert_chores(kid_ids, title, clean(b.get("notes"), 500), cents(reward), due,
-                        together=bool(b.get("together")), ext_key=key, source=g.token["name"])
+                        mode=chore_mode(b), ext_key=key, source=g.token["name"])
     db().commit()
     made = rows(OPEN_CHORES_SQL + " AND c.id IN (%s) ORDER BY c.id" % ",".join("?" * len(ids)), ids)
     return jsonify(ok=True, created=True, chores=[ext_chore(c) for c in made]), 201
@@ -919,7 +976,7 @@ def ext_delete_chore(cid):
     if c["status"] != "todo":
         abort(400, "Only chores that are still to do can be deleted here")
     for r in group_of("chores", c):
-        if r["status"] == "todo":
+        if r["status"] in ("todo", "taken"):
             db().execute("DELETE FROM chores WHERE id=?", (r["id"],))
     db().commit()
     return jsonify(ok=True)
